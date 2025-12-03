@@ -1,0 +1,27 @@
+[Unit]
+Description=Whisper Gradio Web Interface Service
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/whisperTest
+# Conda 环境配置（部署脚本会自动更新这些路径）
+Environment="PATH=/opt/conda/bin:/opt/conda/envs/whisper-api/bin"
+# 如果使用 venv，取消注释下面这行并注释上面的 Environment
+# Environment="PATH=/opt/whisperTest/venv/bin"
+ExecStart=/opt/conda/envs/whisper-api/bin/python scripts/run_gradio_production.py
+# 如果使用 venv，取消注释下面这行并注释上面的 ExecStart
+# ExecStart=/opt/whisperTest/venv/bin/python scripts/run_gradio_production.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/opt/whisperTest/logs/gradio_service.log
+StandardError=append:/opt/whisperTest/logs/gradio_service_error.log
+
+# 资源限制
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+

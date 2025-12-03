@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  whisper-api:
+    build: .
+    container_name: whisper-api
+    ports:
+      - "18000:18000"
+      - "17000:17000"
+    volumes:
+      - ./logs:/app/logs
+      - ./tmp:/app/tmp
+      # 如果需要持久化模型，取消注释
+      # - ~/.cache/whisper:/root/.cache/whisper
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:18000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    # 资源限制
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 8G
+        reservations:
+          cpus: '2'
+          memory: 4G
+    # 如果使用 GPU，取消注释
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
