@@ -1,4 +1,5 @@
 @echo off
+chcp 65001 >nul
 REM NSSM 服务卸载脚本
 REM 卸载三个 Whisper API Windows 服务
 

@@ -1,4 +1,5 @@
 @echo off
+chcp 65001 >nul
 REM NSSM 服务安装脚本
 REM 将三个 Whisper API 服务注册为 Windows 服务
 
@@ -41,8 +42,8 @@ set SERVICE_DESCRIPTION=Whisper 音频转文字 API 服务
 
 REM Python 路径（请根据实际情况修改）
 REM 如果使用 conda：
-set PYTHON_EXE=C:\ProgramData\anaconda3\envs\whisper2\python.exe
-REM 如果使用 venv，取消注释下面这行并注释上面的 conda 行：
+set PYTHON_EXE=C:\ProgramData\anaconda3\envs\whisper\python.exe
+REM 如果使用 venv：
 REM set PYTHON_EXE=%PROJECT_ROOT%\venv\Scripts\python.exe
 
 REM 检查 Python 是否存在
