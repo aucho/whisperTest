@@ -202,7 +202,18 @@ async def transcribe_audio(
     """
     try:
         # 验证模型名称
-        valid_models = ["tiny", "base", "small", "medium", "large"]
+        valid_models = [
+            "tiny",
+            "base",
+            "small",
+            "medium",
+            "large",
+            "turbo",
+            "tiny.en",
+            "base.en",
+            "small.en",
+            "medium.en",
+        ]
         if model_name not in valid_models:
             raise HTTPException(
                 status_code=400,
@@ -280,7 +291,18 @@ async def transcribe_start(
     """
     try:
         # 验证模型名称
-        valid_models = ["tiny", "base", "small", "medium", "large"]
+        valid_models = [
+            "tiny",
+            "base",
+            "small",
+            "medium",
+            "large",
+            "turbo",
+            "tiny.en",
+            "base.en",
+            "small.en",
+            "medium.en",
+        ]
         if model_name not in valid_models:
             raise HTTPException(
                 status_code=400,
