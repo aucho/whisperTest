@@ -8,17 +8,23 @@ set PROJECT_ROOT=%~dp0\..
 set NSSM_CMD=nssm
 
 %NSSM_CMD% --version >nul 2>&1
-if %ERRORLEVEL% NEQ 0 or %ERRORLEVEL% NEQ 1 (
-    nssm.exe --version >nul 2>&1
-    if %ERRORLEVEL% NEQ 0 or %ERRORLEVEL% NEQ 1 (
-        echo [error] NSSM not found, please install NSSM first
-        echo.
-        echo download address: https://nssm.cc/download
-        echo after installation, please add NSSM to the system PATH, or modify the NSSM_CMD variable in this script
-        pause
-        exit /b 1
-    ) else (
-        set NSSM_CMD=nssm.exe
+if %ERRORLEVEL% NEQ 0 (
+    if %ERRORLEVEL% NEQ 1 (
+        nssm.exe --version >nul 2>&1
+        if %ERRORLEVEL% NEQ 0 (
+            if %ERRORLEVEL% NEQ 1 (
+                echo [error] NSSM not found, please install NSSM first
+                echo.
+                echo download address: https://nssm.cc/download
+                echo after installation, please add NSSM to the system PATH, or modify the NSSM_CMD variable in this script
+                pause
+                exit /b 1
+            ) else (
+                set NSSM_CMD=nssm.exe
+            )
+        ) else (
+            set NSSM_CMD=nssm.exe
+        )
     )
 )
 
