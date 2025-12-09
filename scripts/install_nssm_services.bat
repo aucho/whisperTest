@@ -13,15 +13,21 @@ REM 如果 NSSM 在系统 PATH 中，可以直接使用 nssm
 REM 否则需要指定完整路径，例如：C:\tools\nssm\nssm.exe
 set NSSM_CMD=nssm
 
-REM 检查 NSSM 是否可用
-where %NSSM_CMD% >nul 2>&1
+REM 检查 NSSM 是否可用（直接尝试运行命令）
+%NSSM_CMD% --version >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
-    echo [错误] 未找到 NSSM，请先安装 NSSM
-    echo.
-    echo 下载地址: https://nssm.cc/download
-    echo 安装后，请将 NSSM 添加到系统 PATH，或修改此脚本中的 NSSM_CMD 变量
-    pause
-    exit /b 1
+    REM 尝试使用 nssm.exe
+    nssm.exe --version >nul 2>&1
+    if %ERRORLEVEL% NEQ 0 (
+        echo [错误] 未找到 NSSM，请先安装 NSSM
+        echo.
+        echo 下载地址: https://nssm.cc/download
+        echo 安装后，请将 NSSM 添加到系统 PATH，或修改此脚本中的 NSSM_CMD 变量
+        pause
+        exit /b 1
+    ) else (
+        set NSSM_CMD=nssm.exe
+    )
 )
 
 echo ========================================
