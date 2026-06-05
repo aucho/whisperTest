@@ -24,6 +24,35 @@ from src.core import process_audio, get_language_display
 TASK_STATUS = {}
 RUNNING_TASKS: Dict[str, asyncio.Task] = {}
 TASK_DIR = Path("./storage/tasks")
+STATUS_RETENTION_SECONDS = 3600
+TASK_FILE_RETENTION_SECONDS = 86400
+
+
+async def _cleanup_task_status_after(task_step_id: str, delay_seconds: int):
+    await asyncio.sleep(delay_seconds)
+    TASK_STATUS.pop(task_step_id, None)
+
+
+async def _cleanup_old_task_files_loop():
+    import time
+    import shutil
+    while True:
+        await asyncio.sleep(3600)
+        try:
+            if not TASK_DIR.exists():
+                continue
+            now = time.time()
+            for task_path in TASK_DIR.iterdir():
+                if not task_path.is_dir():
+                    continue
+                try:
+                    mtime = task_path.stat().st_mtime
+                    if now - mtime > TASK_FILE_RETENTION_SECONDS:
+                        shutil.rmtree(task_path)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
 
 def update_task_status(task_step_id: str, **fields):
@@ -127,6 +156,7 @@ async def run_transcribe_task(
     finally:
         cleanup_resources()
         RUNNING_TASKS.pop(task_step_id, None)
+        asyncio.create_task(_cleanup_task_status_after(task_step_id, STATUS_RETENTION_SECONDS))
 
 
 def cleanup_resources():
@@ -151,6 +181,11 @@ api_app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@api_app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(_cleanup_old_task_files_loop())
 
 
 @api_app.get("/")
@@ -262,9 +297,9 @@ async def transcribe_audio(
             return JSONResponse(content=response)
 
         finally:
-            # 清理临时文件
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
+            cleanup_resources()
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"处理音频时出错: {str(e)}")
