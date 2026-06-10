@@ -16,6 +16,19 @@ import torch
 import asyncio
 import gc
 
+# 流式写盘的分块大小（1MB），避免将整个音频一次性读入内存
+_UPLOAD_CHUNK_SIZE = 1024 * 1024
+
+
+async def _save_upload_to_path(file: UploadFile, dest_path: str):
+    """分块将上传文件写入磁盘，降低大文件的内存峰值。"""
+    with open(dest_path, "wb") as out:
+        while True:
+            chunk = await file.read(_UPLOAD_CHUNK_SIZE)
+            if not chunk:
+                break
+            out.write(chunk)
+
 # 添加项目根目录到 Python 路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -23,14 +36,31 @@ from src.core import process_audio, get_language_display
 
 TASK_STATUS = {}
 RUNNING_TASKS: Dict[str, asyncio.Task] = {}
+# 记录已调度清理的任务，避免重复轮询时反复创建清理协程
+_STATUS_CLEANUP_SCHEDULED: set = set()
 TASK_DIR = Path("./storage/tasks")
 STATUS_RETENTION_SECONDS = 3600
 TASK_FILE_RETENTION_SECONDS = 86400
 
 
 async def _cleanup_task_status_after(task_step_id: str, delay_seconds: int):
-    await asyncio.sleep(delay_seconds)
-    TASK_STATUS.pop(task_step_id, None)
+    try:
+        await asyncio.sleep(delay_seconds)
+    finally:
+        TASK_STATUS.pop(task_step_id, None)
+        _STATUS_CLEANUP_SCHEDULED.discard(task_step_id)
+
+
+def _schedule_status_cleanup(task_step_id: str, delay_seconds: int = STATUS_RETENTION_SECONDS):
+    """安全地调度内存状态清理（仅在有运行中的事件循环时生效，且不重复调度）。"""
+    if task_step_id in _STATUS_CLEANUP_SCHEDULED:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    _STATUS_CLEANUP_SCHEDULED.add(task_step_id)
+    loop.create_task(_cleanup_task_status_after(task_step_id, delay_seconds))
 
 
 async def _cleanup_old_task_files_loop():
@@ -78,8 +108,9 @@ def get_task_status(task_step_id: str) -> dict:
     if status_file.exists():
         try:
             status_data = json.loads(status_file.read_text(encoding="utf-8"))
-            # 更新内存中的状态
+            # 更新内存中的状态，并调度清理，避免轮询历史任务导致内存只增不减
             TASK_STATUS[task_step_id] = status_data
+            _schedule_status_cleanup(task_step_id)
             return status_data
         except Exception:
             pass
@@ -156,7 +187,7 @@ async def run_transcribe_task(
     finally:
         cleanup_resources()
         RUNNING_TASKS.pop(task_step_id, None)
-        asyncio.create_task(_cleanup_task_status_after(task_step_id, STATUS_RETENTION_SECONDS))
+        _schedule_status_cleanup(task_step_id, STATUS_RETENTION_SECONDS)
 
 
 def cleanup_resources():
@@ -255,13 +286,10 @@ async def transcribe_audio(
                 detail=f"无效的模型名称。可选值: {', '.join(valid_models)}",
             )
 
-        # 保存上传的文件到临时目录
-        with tempfile.NamedTemporaryFile(
-            delete=False, suffix=os.path.splitext(file.filename)[1]
-        ) as tmp_file:
-            content = await file.read()
-            tmp_file.write(content)
-            tmp_path = tmp_file.name
+        # 保存上传的文件到临时目录（流式写盘，避免大文件占满内存）
+        fd, tmp_path = tempfile.mkstemp(suffix=os.path.splitext(file.filename)[1])
+        os.close(fd)
+        await _save_upload_to_path(file, tmp_path)
 
         try:
             # 将语言代码转换为中文选项（用于 process_audio 函数）
@@ -275,8 +303,9 @@ async def transcribe_audio(
                 else language_map_reverse.get(language, "自动检测")
             )
 
-            # 处理音频
-            plain_text, timestamped_text, detected_language = process_audio(
+            # 在线程池中执行同步的转录任务，避免阻塞事件循环
+            plain_text, timestamped_text, detected_language = await asyncio.to_thread(
+                process_audio,
                 tmp_path,
                 model_name=model_name,
                 language_choice=language_choice,
@@ -348,10 +377,9 @@ async def transcribe_start(
         task_path = TASK_DIR / task_step_id
         task_path.mkdir(parents=True, exist_ok=True)
 
-        # 保存上传的文件到任务目录
+        # 保存上传的文件到任务目录（流式写盘，避免大文件占满内存）
         audio_path = task_path / file.filename
-        content = await file.read()
-        audio_path.write_bytes(content)
+        await _save_upload_to_path(file, str(audio_path))
 
         # 将语言代码转换为中文选项（用于 process_audio 函数）
         language_map_reverse = {
