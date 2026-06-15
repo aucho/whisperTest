@@ -5,6 +5,7 @@
 import gc
 import os
 import subprocess
+import sys
 import threading
 from collections import OrderedDict
 
@@ -88,6 +89,39 @@ def _load_model_cached(model_name: str):
         return model
 
 
+def _trim_process_memory():
+    """把已释放的内存尽量归还操作系统。
+
+    仅靠 gc/free 在 Windows 上不会让进程工作集下降（CRT 堆不还给 OS），
+    因此显式裁剪工作集；Linux 上调用 malloc_trim。
+    """
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        try:
+            torch.cuda.ipc_collect()
+        except AttributeError:
+            pass
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32
+            # (SIZE_T)-1, (SIZE_T)-1 让系统将工作集裁剪到最小
+            kernel32.SetProcessWorkingSetSize(
+                ctypes.c_void_p(kernel32.GetCurrentProcess()),
+                ctypes.c_size_t(-1),
+                ctypes.c_size_t(-1),
+            )
+        elif sys.platform.startswith("linux"):
+            import ctypes
+
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        # 内存裁剪是尽力而为，失败不影响主流程
+        pass
+
+
 def release_model(model_name: str = None):
     with _model_lock:
         if model_name is None:
@@ -96,9 +130,7 @@ def release_model(model_name: str = None):
             device = _get_device()
             cache_key = f"{model_name}_{device}"
             _model_cache.pop(cache_key, None)
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    _trim_process_memory()
 
 
 def _cleanup_cuda():

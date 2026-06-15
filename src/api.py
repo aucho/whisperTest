@@ -32,7 +32,7 @@ async def _save_upload_to_path(file: UploadFile, dest_path: str):
 # 添加项目根目录到 Python 路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.core import process_audio, get_language_display
+from src.core import process_audio, get_language_display, release_model
 
 TASK_STATUS = {}
 RUNNING_TASKS: Dict[str, asyncio.Task] = {}
@@ -41,6 +41,49 @@ _STATUS_CLEANUP_SCHEDULED: set = set()
 TASK_DIR = Path("./storage/tasks")
 STATUS_RETENTION_SECONDS = 3600
 TASK_FILE_RETENTION_SECONDS = 86400
+
+
+def _read_int_env(name: str, default: int) -> int:
+    try:
+        return max(0, int(os.environ.get(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+# 空闲多少秒后卸载已缓存的模型并归还内存。0 表示任务一空闲就立即卸载。
+# 卸载后下次请求会重新加载模型（有冷启动开销），用内存换常驻占用。
+MODEL_IDLE_TIMEOUT = _read_int_env("WHISPER_MODEL_IDLE_TIMEOUT", 60)
+_model_release_handle: Optional[asyncio.TimerHandle] = None
+
+
+def _cancel_idle_model_release():
+    """有新任务进入时取消待执行的模型卸载。"""
+    global _model_release_handle
+    if _model_release_handle is not None:
+        _model_release_handle.cancel()
+        _model_release_handle = None
+
+
+def _do_idle_model_release():
+    global _model_release_handle
+    _model_release_handle = None
+    if RUNNING_TASKS:
+        return
+    # 在线程中卸载，避免释放大模型时阻塞事件循环
+    asyncio.create_task(asyncio.to_thread(release_model))
+
+
+def _schedule_idle_model_release():
+    """当没有运行中的任务时，调度一次（防抖的）模型卸载。"""
+    global _model_release_handle
+    if RUNNING_TASKS:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    _cancel_idle_model_release()
+    _model_release_handle = loop.call_later(MODEL_IDLE_TIMEOUT, _do_idle_model_release)
 
 
 async def _cleanup_task_status_after(task_step_id: str, delay_seconds: int):
@@ -188,6 +231,8 @@ async def run_transcribe_task(
         cleanup_resources()
         RUNNING_TASKS.pop(task_step_id, None)
         _schedule_status_cleanup(task_step_id, STATUS_RETENTION_SECONDS)
+        # 没有其它任务在排队时，调度空闲卸载模型以释放常驻内存
+        _schedule_idle_model_release()
 
 
 def cleanup_resources():
@@ -286,6 +331,9 @@ async def transcribe_audio(
                 detail=f"无效的模型名称。可选值: {', '.join(valid_models)}",
             )
 
+        # 有新任务进入，取消待执行的模型卸载
+        _cancel_idle_model_release()
+
         # 保存上传的文件到临时目录（流式写盘，避免大文件占满内存）
         fd, tmp_path = tempfile.mkstemp(suffix=os.path.splitext(file.filename)[1])
         os.close(fd)
@@ -329,6 +377,8 @@ async def transcribe_audio(
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
             cleanup_resources()
+            # 同步请求结束后调度空闲卸载，释放常驻模型内存
+            _schedule_idle_model_release()
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"处理音频时出错: {str(e)}")
@@ -401,6 +451,9 @@ async def transcribe_start(
             language=language or "auto",
             language_display=language_choice,
         )
+
+        # 有新任务进入，取消待执行的模型卸载
+        _cancel_idle_model_release()
 
         # 将转录任务添加到事件循环
         task = asyncio.create_task(
