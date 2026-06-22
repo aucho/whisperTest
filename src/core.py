@@ -6,6 +6,7 @@ import gc
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 from collections import OrderedDict
 
@@ -139,39 +140,73 @@ def _cleanup_cuda():
         torch.cuda.empty_cache()
 
 
+def _read_text_tail(path: str, max_bytes: int = 4096) -> str:
+    """读取文件末尾若干字节，避免一次性把大文件读进内存。"""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            if size > max_bytes:
+                f.seek(-max_bytes, os.SEEK_END)
+            return f.read().decode(errors="ignore").strip()
+    except OSError:
+        return ""
+
+
 def _load_audio_with_timeout(file: str, sr: int = _WHISPER_SAMPLE_RATE):
     """带超时的音频解码（等价于 whisper.load_audio）。
 
-    whisper 原生 load_audio 在 ffmpeg 读取线程 OOM 时会让 communicate() 永久挂起，
-    导致后台任务卡在 processing。这里加 timeout，将挂起转为可捕获的异常。
+    关键点：ffmpeg 的 stdout 与 stderr 都不走内存管道。
+    - stdout(PCM) 写临时文件，避免长音频把整段数据堆进 subprocess 读线程内存；
+    - stderr 也写临时文件并降到 error 级别，避免 ffmpeg 刷出海量警告/进度行时
+      stderr 读线程一次性 fh.read() 触发 MemoryError；
+    再用 np.fromfile 加载并原地转 float32，峰值内存可控，且可超时中断。
     """
+    fd, pcm_path = tempfile.mkstemp(suffix=".pcm")
+    os.close(fd)
+    err_fd, err_path = tempfile.mkstemp(suffix=".log")
     cmd = [
         "ffmpeg",
         "-nostdin",
+        "-y",
+        "-loglevel", "error",
+        "-nostats",
         "-threads", "0",
         "-i", file,
         "-f", "s16le",
         "-ac", "1",
         "-acodec", "pcm_s16le",
         "-ar", str(sr),
-        "-",
+        pcm_path,
     ]
     try:
-        out = subprocess.run(
-            cmd,
-            capture_output=True,
-            check=True,
-            timeout=AUDIO_LOAD_TIMEOUT,
-        ).stdout
+        with os.fdopen(err_fd, "wb") as err_f:
+            proc = subprocess.run(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=err_f,
+                timeout=AUDIO_LOAD_TIMEOUT,
+            )
+        if proc.returncode != 0:
+            raise RuntimeError(f"音频解码失败: {_read_text_tail(err_path)}")
+
+        # 原地转换，降低峰值内存：int16(N*2) + float32(N*4)，转换后立即释放 int16
+        audio_i16 = np.fromfile(pcm_path, dtype=np.int16)
+        audio = audio_i16.astype(np.float32)
+        del audio_i16
+        audio /= 32768.0
+        return audio
     except subprocess.TimeoutExpired as e:
         raise RuntimeError(
             f"音频解码超时（>{AUDIO_LOAD_TIMEOUT}s），文件可能过大或已损坏"
         ) from e
-    except subprocess.CalledProcessError as e:
-        stderr = e.stderr.decode(errors="ignore") if e.stderr else ""
-        raise RuntimeError(f"音频解码失败: {stderr}") from e
-
-    return np.frombuffer(out, np.int16).flatten().astype(np.float32) / 32768.0
+    finally:
+        for _p in (pcm_path, err_path):
+            if os.path.exists(_p):
+                try:
+                    os.unlink(_p)
+                except OSError:
+                    pass
 
 
 def process_audio(audio_path, model_name="base", language_choice="自动检测", verbose=True):
