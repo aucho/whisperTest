@@ -54,6 +54,37 @@ LANGUAGE_DISPLAY_MAP = {
     "es": "西班牙语",
 }
 
+# Whisper initial_prompt：电商直播风格示例，引导模型输出标点与带货话术
+TRANSCRIBE_INITIAL_PROMPTS = {
+    "en": (
+        "Hey everyone, welcome to the live stream! Today we have an exclusive deal — "
+        "originally $29.99, now only $14.99! Tap the yellow cart to order, limited stock! "
+        "Drop your questions in the chat, we'll answer right away."
+    ),
+    "es": (
+        "¡Hola a todos, bienvenidos al directo! Hoy tenemos una oferta exclusiva: "
+        "antes 29,99 €, ¡ahora solo 14,99 €! Toca el carrito para comprar, ¡stock limitado! "
+        "Deja tus preguntas en el chat, te respondemos al momento."
+    ),
+}
+
+DEFAULT_TRANSCRIBE_INITIAL_PROMPT = (
+    "家人们，欢迎来到直播间！今天这款宝贝限时秒杀，原价九十九元，现价只要四十九块九！"
+    "喜欢的宝宝赶紧拍，库存不多，手慢无！有问题可以在评论区留言，主播马上回复。"
+)
+
+
+def _get_transcribe_initial_prompt(language: str | None) -> str:
+    return TRANSCRIBE_INITIAL_PROMPTS.get(language, DEFAULT_TRANSCRIBE_INITIAL_PROMPT)
+
+
+def resolve_transcribe_initial_prompt(
+    language: str | None, initial_prompt: str | None = None
+) -> str:
+    if initial_prompt and initial_prompt.strip():
+        return initial_prompt.strip()
+    return _get_transcribe_initial_prompt(language)
+
 
 def get_language_display(language_code: str | None) -> str:
     if not language_code:
@@ -279,7 +310,13 @@ def _patch_whisper_load_audio():
 _patch_whisper_load_audio()
 
 
-def process_audio(audio_path, model_name="base", language_choice="自动检测", verbose=True):
+def process_audio(
+    audio_path,
+    model_name="base",
+    language_choice="自动检测",
+    verbose=True,
+    initial_prompt: str | None = None,
+):
     """处理音频文件的核心函数"""
     if audio_path is None:
         return "请上传音频文件", "", None
@@ -298,6 +335,9 @@ def process_audio(audio_path, model_name="base", language_choice="自动检测",
     transcribe_kwargs = {
         "verbose": verbose,
         "fp16": device == "cuda",
+        "initial_prompt": resolve_transcribe_initial_prompt(
+            selected_language, initial_prompt
+        ),
     }
     if selected_language:
         transcribe_kwargs["language"] = selected_language

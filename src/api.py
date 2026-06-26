@@ -168,6 +168,7 @@ async def run_transcribe_task(
     model_name: str,
     language_choice: str,
     include_timestamps: bool,
+    initial_prompt: Optional[str] = None,
 ):
     """后台任务：执行转录并保存结果"""
     try:
@@ -185,6 +186,7 @@ async def run_transcribe_task(
             model_name=model_name,
             language_choice=language_choice,
             verbose=False,
+            initial_prompt=initial_prompt,
         )
 
         # 保存结果到文件
@@ -301,6 +303,10 @@ async def transcribe_audio(
         None, description="语言代码: en(英语), es(西班牙语), 或留空自动检测"
     ),
     include_timestamps: bool = Form(False, description="是否包含时间戳"),
+    initial_prompt: Optional[str] = Form(
+        None,
+        description="转写引导提示词，留空则使用内置电商直播风格默认提示",
+    ),
 ):
     """
     转写音频文件为文字
@@ -310,6 +316,7 @@ async def transcribe_audio(
     - model_name: Whisper 模型名称 (tiny, base, small, medium, large)
     - language: 语言代码 (en, es 等)，留空则自动检测
     - include_timestamps: 是否在结果中包含时间戳信息
+    - initial_prompt: 转写引导提示词，用于引导标点与话术风格
     """
     try:
         # 验证模型名称
@@ -358,6 +365,7 @@ async def transcribe_audio(
                 model_name=model_name,
                 language_choice=language_choice,
                 verbose=False,
+                initial_prompt=initial_prompt,
             )
 
             # 构建响应
@@ -396,6 +404,10 @@ async def transcribe_start(
     ),
     include_timestamps: bool = Form(False, description="是否包含时间戳"),
     task_step_id: str = Form(..., description="任务步骤ID 用于查询文件保存路径"),
+    initial_prompt: Optional[str] = Form(
+        None,
+        description="转写引导提示词，留空则使用内置电商直播风格默认提示",
+    ),
 ):
     """
     启动异步转录任务
@@ -463,6 +475,7 @@ async def transcribe_start(
                 model_name,
                 language_choice,
                 include_timestamps,
+                initial_prompt,
             )
         )
         RUNNING_TASKS[task_step_id] = task
