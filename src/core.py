@@ -152,61 +152,131 @@ def _read_text_tail(path: str, max_bytes: int = 4096) -> str:
         return ""
 
 
+def _run_ffmpeg(cmd: list[str], timeout: int) -> int:
+    """运行 ffmpeg，stdin/stdout/stderr 全部丢弃，绝不创建 PIPE 读线程。"""
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        proc.kill()
+        proc.wait()
+        raise e
+    return proc.returncode
+
+
+def _pcm_file_to_float32(pcm_path: str) -> np.ndarray:
+    """分块把 PCM int16 文件转成 float32，避免整段 int16 数组再占一份内存。"""
+    file_size = os.path.getsize(pcm_path)
+    if file_size < 2 or file_size % 2 != 0:
+        raise RuntimeError("音频解码结果无效（PCM 文件为空或损坏）")
+
+    n_samples = file_size // 2
+    audio = np.empty(n_samples, dtype=np.float32)
+    # 每次约 30 秒 16kHz 单声道，控制临时缓冲区大小
+    chunk_samples = 30 * _WHISPER_SAMPLE_RATE
+    offset = 0
+    with open(pcm_path, "rb") as pcm_f:
+        while offset < n_samples:
+            count = min(chunk_samples, n_samples - offset)
+            raw = pcm_f.read(count * 2)
+            if len(raw) < count * 2:
+                raise RuntimeError("音频解码结果无效（PCM 文件提前结束）")
+            chunk = np.frombuffer(raw, dtype=np.int16)
+            audio[offset : offset + count] = chunk.astype(np.float32) / 32768.0
+            offset += count
+    return audio
+
+
 def _load_audio_with_timeout(file: str, sr: int = _WHISPER_SAMPLE_RATE):
     """带超时的音频解码（等价于 whisper.load_audio）。
 
-    关键点：ffmpeg 的 stdout 与 stderr 都不走内存管道。
-    - stdout(PCM) 写临时文件，避免长音频把整段数据堆进 subprocess 读线程内存；
-    - stderr 也写临时文件并降到 error 级别，避免 ffmpeg 刷出海量警告/进度行时
-      stderr 读线程一次性 fh.read() 触发 MemoryError；
-    再用 np.fromfile 加载并原地转 float32，峰值内存可控，且可超时中断。
-    """
+    关键点：ffmpeg 的 stdout/stderr 都不走内存管道（subprocess.PIPE）。
+    whisper 默认 load_audio 用 capture_output=True，长音频会在 _readerthread 里
+    fh.read() 整段 stdout，极易 MemoryError；这里改为：
+    - PCM 由 ffmpeg 直接写临时文件；
+    - 子进程三流全部 DEVNULL，由 Popen.wait 等待，可超时 kill；
+    - 失败时再用 -logfile 写盘读尾部错误信息（仍不走 PIPE）。
+  """
     fd, pcm_path = tempfile.mkstemp(suffix=".pcm")
     os.close(fd)
-    err_fd, err_path = tempfile.mkstemp(suffix=".log")
+    err_path = None
     cmd = [
         "ffmpeg",
         "-nostdin",
+        "-hide_banner",
         "-y",
-        "-loglevel", "error",
+        "-loglevel",
+        "error",
         "-nostats",
-        "-threads", "0",
-        "-i", file,
-        "-f", "s16le",
-        "-ac", "1",
-        "-acodec", "pcm_s16le",
-        "-ar", str(sr),
+        "-threads",
+        "0",
+        "-i",
+        file,
+        "-f",
+        "s16le",
+        "-ac",
+        "1",
+        "-acodec",
+        "pcm_s16le",
+        "-ar",
+        str(sr),
         pcm_path,
     ]
     try:
-        with os.fdopen(err_fd, "wb") as err_f:
-            proc = subprocess.run(
-                cmd,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=err_f,
-                timeout=AUDIO_LOAD_TIMEOUT,
-            )
-        if proc.returncode != 0:
-            raise RuntimeError(f"音频解码失败: {_read_text_tail(err_path)}")
+        returncode = _run_ffmpeg(cmd, AUDIO_LOAD_TIMEOUT)
+        if returncode != 0:
+            err_fd, err_path = tempfile.mkstemp(suffix=".log")
+            os.close(err_fd)
+            retry_cmd = [
+                "ffmpeg",
+                "-nostdin",
+                "-hide_banner",
+                "-y",
+                "-loglevel",
+                "error",
+                "-nostats",
+                "-logfile",
+                err_path,
+                "-i",
+                file,
+                "-f",
+                "null",
+                "-",
+            ]
+            _run_ffmpeg(retry_cmd, min(120, AUDIO_LOAD_TIMEOUT))
+            detail = _read_text_tail(err_path) or f"ffmpeg exit code {returncode}"
+            raise RuntimeError(f"音频解码失败: {detail}")
 
-        # 原地转换，降低峰值内存：int16(N*2) + float32(N*4)，转换后立即释放 int16
-        audio_i16 = np.fromfile(pcm_path, dtype=np.int16)
-        audio = audio_i16.astype(np.float32)
-        del audio_i16
-        audio /= 32768.0
-        return audio
+        return _pcm_file_to_float32(pcm_path)
     except subprocess.TimeoutExpired as e:
         raise RuntimeError(
             f"音频解码超时（>{AUDIO_LOAD_TIMEOUT}s），文件可能过大或已损坏"
         ) from e
     finally:
         for _p in (pcm_path, err_path):
-            if os.path.exists(_p):
+            if _p and os.path.exists(_p):
                 try:
                     os.unlink(_p)
                 except OSError:
                     pass
+
+
+def _patch_whisper_load_audio():
+    """防止库内部或其它代码路径仍调用默认的 pipe 版 load_audio。"""
+    try:
+        import whisper.audio as whisper_audio
+
+        whisper_audio.load_audio = _load_audio_with_timeout
+    except Exception:
+        pass
+
+
+_patch_whisper_load_audio()
 
 
 def process_audio(audio_path, model_name="base", language_choice="自动检测", verbose=True):
