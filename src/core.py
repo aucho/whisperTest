@@ -98,12 +98,13 @@ def _get_device():
 
 def _evict_until_within_limit():
     """在持有 _model_lock 的前提下调用：淘汰超出上限的最久未使用模型并释放资源。"""
+    evicted = False
     while len(_model_cache) > MAX_CACHED_MODELS:
         _, old_model = _model_cache.popitem(last=False)
         del old_model
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        evicted = True
+    if evicted:
+        _trim_process_memory()
 
 
 def _load_model_cached(model_name: str):
@@ -154,6 +155,9 @@ def _trim_process_memory():
         pass
 
 
+trim_process_memory = _trim_process_memory
+
+
 def release_model(model_name: str = None):
     with _model_lock:
         if model_name is None:
@@ -163,12 +167,6 @@ def release_model(model_name: str = None):
             cache_key = f"{model_name}_{device}"
             _model_cache.pop(cache_key, None)
     _trim_process_memory()
-
-
-def _cleanup_cuda():
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
 
 
 def _read_text_tail(path: str, max_bytes: int = 4096) -> str:
@@ -342,32 +340,36 @@ def process_audio(
     if selected_language:
         transcribe_kwargs["language"] = selected_language
 
-    # 解码与推理一起串行化：保证同进程同一时刻只有一段音频驻留内存，
-    # 避免并发任务同时解码大音频导致内存峰值叠加 -> MemoryError。
-    with _inference_lock:
-        audio = _load_audio_with_timeout(audio_path)
-        try:
-            result = model.transcribe(
-                audio,
-                **transcribe_kwargs,
-            )
-        finally:
-            # 尽快释放解码后的大数组
-            del audio
-
-    plain_text = result["text"].strip()
-
+    plain_text = ""
     timestamped_text = ""
-    if "segments" in result:
-        for seg in result["segments"]:
-            start = format_timestamp(seg["start"])
-            end = format_timestamp(seg["end"])
-            timestamped_text += f"[{start} --> {end}] {seg['text'].strip()}\n"
+    detected_language = None
+    result = None
+    try:
+        # 解码与推理一起串行化：保证同进程同一时刻只有一段音频驻留内存，
+        # 避免并发任务同时解码大音频导致内存峰值叠加 -> MemoryError。
+        with _inference_lock:
+            audio = _load_audio_with_timeout(audio_path)
+            try:
+                result = model.transcribe(
+                    audio,
+                    **transcribe_kwargs,
+                )
+            finally:
+                del audio
 
-    detected_language = selected_language or result.get("language")
+        plain_text = result["text"].strip()
 
-    if device == "cuda":
-        _cleanup_cuda()
+        if "segments" in result:
+            for seg in result["segments"]:
+                start = format_timestamp(seg["start"])
+                end = format_timestamp(seg["end"])
+                timestamped_text += f"[{start} --> {end}] {seg['text'].strip()}\n"
+
+        detected_language = selected_language or result.get("language")
+    finally:
+        if result is not None:
+            del result
+        _trim_process_memory()
 
     return plain_text, timestamped_text.strip(), detected_language
 

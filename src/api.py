@@ -14,7 +14,6 @@ import tempfile
 from typing import Optional, Dict
 import torch
 import asyncio
-import gc
 
 # 流式写盘的分块大小（1MB），避免将整个音频一次性读入内存
 _UPLOAD_CHUNK_SIZE = 1024 * 1024
@@ -32,7 +31,7 @@ async def _save_upload_to_path(file: UploadFile, dest_path: str):
 # 添加项目根目录到 Python 路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.core import process_audio, get_language_display, release_model
+from src.core import process_audio, get_language_display, release_model, trim_process_memory
 
 TASK_STATUS = {}
 RUNNING_TASKS: Dict[str, asyncio.Task] = {}
@@ -128,13 +127,24 @@ async def _cleanup_old_task_files_loop():
             pass
 
 
+def _sanitize_status(status_data: dict) -> dict:
+    """剔除 status 中的大段转写正文，避免内存与 status.json 膨胀。"""
+    sanitized = dict(status_data)
+    sanitized.pop("timestamped_text", None)
+    sanitized.pop("plain_text", None)
+    return sanitized
+
+
 def update_task_status(task_step_id: str, **fields):
+    fields = _sanitize_status(fields)
     TASK_STATUS.setdefault(task_step_id, {})
     TASK_STATUS[task_step_id].update(fields)
+    clean_status = _sanitize_status(TASK_STATUS[task_step_id])
+    TASK_STATUS[task_step_id] = clean_status
     task_path = TASK_DIR / task_step_id
     task_path.mkdir(parents=True, exist_ok=True)
     (task_path / "status.json").write_text(
-        json.dumps(TASK_STATUS[task_step_id], ensure_ascii=False), encoding="utf-8"
+        json.dumps(clean_status, ensure_ascii=False), encoding="utf-8"
     )
 
 
@@ -142,7 +152,9 @@ def get_task_status(task_step_id: str) -> dict:
     """获取任务状态，优先从内存读取，如果不存在则从文件读取"""
     # 先尝试从内存读取
     if task_step_id in TASK_STATUS:
-        return TASK_STATUS[task_step_id]
+        clean_status = _sanitize_status(TASK_STATUS[task_step_id])
+        TASK_STATUS[task_step_id] = clean_status
+        return clean_status
 
     # 从文件读取
     task_path = TASK_DIR / task_step_id
@@ -150,7 +162,9 @@ def get_task_status(task_step_id: str) -> dict:
 
     if status_file.exists():
         try:
-            status_data = json.loads(status_file.read_text(encoding="utf-8"))
+            status_data = _sanitize_status(
+                json.loads(status_file.read_text(encoding="utf-8"))
+            )
             # 更新内存中的状态，并调度清理，避免轮询历史任务导致内存只增不减
             TASK_STATUS[task_step_id] = status_data
             _schedule_status_cleanup(task_step_id)
@@ -207,8 +221,6 @@ async def run_transcribe_task(
             task_step_id,
             status="completed",
             message="转录完成",
-            # plain_text=plain_text,
-            timestamped_text=timestamped_text if include_timestamps else None,
             language_detected=detected_language,
             language_detected_display=get_language_display(detected_language),
         )
@@ -238,14 +250,8 @@ async def run_transcribe_task(
 
 
 def cleanup_resources():
-    """清理内存和显存，避免资源泄漏"""
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        try:
-            torch.cuda.ipc_collect()
-        except AttributeError:
-            pass
+    """清理内存和显存，尽量归还操作系统。"""
+    trim_process_memory()
 
 
 # 创建 FastAPI 应用
