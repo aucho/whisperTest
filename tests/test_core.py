@@ -6,7 +6,14 @@ from unittest.mock import patch
 import torch
 import numpy as np
 
-from src.core import ChunkRange, WhisperEngine, build_chunk_ranges, format_timestamp, transcribe_file_chunked
+from src.core import (
+    ChunkRange,
+    WhisperEngine,
+    build_chunk_ranges,
+    format_timestamp,
+    resolve_transcribe_initial_prompt,
+    transcribe_file_chunked,
+)
 
 
 class FakeEngine:
@@ -35,6 +42,16 @@ class FakeEngine:
 
 
 class CoreChunkTests(unittest.TestCase):
+    def test_auto_detection_has_no_builtin_prompt(self):
+        self.assertIsNone(resolve_transcribe_initial_prompt(None, None))
+
+    def test_explicit_prompt_is_kept_during_auto_detection(self):
+        self.assertEqual("custom", resolve_transcribe_initial_prompt(None, " custom "))
+
+    def test_detected_language_selects_matching_prompt(self):
+        self.assertIn("welcome", resolve_transcribe_initial_prompt("en", None).lower())
+        self.assertIn("直播间", resolve_transcribe_initial_prompt("zh", None))
+
     def test_timestamp_rounding_carries_into_next_minute(self):
         self.assertEqual("00:01:00.00", format_timestamp(59.999))
 
@@ -89,6 +106,7 @@ class CoreChunkTests(unittest.TestCase):
     def test_overlap_segments_use_absolute_owner_range(self, _extract, _pcm, _unlink):
         class Model:
             def transcribe(self, audio, **kwargs):
+                self.kwargs = kwargs
                 return {
                     "language": "en",
                     "segments": [
@@ -99,13 +117,15 @@ class CoreChunkTests(unittest.TestCase):
                 }
 
         engine = WhisperEngine.__new__(WhisperEngine)
-        engine.model = Model()
+        model = Model()
+        engine.model = model
         segments, _ = engine.transcribe_range(
             "ignored.mp3", ChunkRange(3600, 7200), 7200, None, None
         )
         self.assertEqual(["boundary", "current"], [item["text"] for item in segments])
         self.assertEqual(3600, segments[0]["start"])
         self.assertEqual(3602, segments[0]["end"])
+        self.assertNotIn("initial_prompt", model.kwargs)
 
 
 if __name__ == "__main__":

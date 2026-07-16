@@ -75,9 +75,13 @@ def get_language_display(language_code: Optional[str]) -> str:
 
 def resolve_transcribe_initial_prompt(
     language: Optional[str], initial_prompt: Optional[str] = None
-) -> str:
+) -> Optional[str]:
     if initial_prompt and initial_prompt.strip():
         return initial_prompt.strip()
+    # 自动检测的首块尚不知道语言，此时不注入任何内置语言提示词，
+    # 防止中文示例把英文 hello 等短词偏置成中文输出。
+    if language is None:
+        return None
     return TRANSCRIBE_INITIAL_PROMPTS.get(language, DEFAULT_TRANSCRIBE_INITIAL_PROMPT)
 
 
@@ -241,11 +245,10 @@ class WhisperEngine:
                 stage_callback("decoding")
             pcm_path = _extract_pcm(audio_path, extract_start, extract_end)
             audio = _pcm_file_to_float32(pcm_path)
-            kwargs = {
-                "verbose": verbose,
-                "fp16": True,
-                "initial_prompt": resolve_transcribe_initial_prompt(language, initial_prompt),
-            }
+            kwargs = {"verbose": verbose, "fp16": True}
+            resolved_prompt = resolve_transcribe_initial_prompt(language, initial_prompt)
+            if resolved_prompt:
+                kwargs["initial_prompt"] = resolved_prompt
             if language:
                 kwargs["language"] = language
             if stage_callback:
