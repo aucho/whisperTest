@@ -137,27 +137,25 @@ net stop WhisperAPI-18000 && net start WhisperAPI-18000
 
 服务日志保存在项目根目录的 `logs` 文件夹中：
 - `logs\service_18000.log`
-- `logs\service_18001.log`
-- `logs\service_18002.log`
+
+18000服务会启动一个独立的 `WhisperTurboWorker` 子进程。主进程负责HTTP、状态与队列，
+子进程固定加载turbo并按1小时分块推理。
 
 ## 访问服务
 
 服务启动后，可以通过以下地址访问：
 
 - **端口 18000**: http://127.0.0.1:18000
-- **端口 18001**: http://127.0.0.1:18001
-- **端口 18002**: http://127.0.0.1:18002
 
 ### API 文档
 
 - Swagger UI: http://127.0.0.1:18000/docs
 - ReDoc: http://127.0.0.1:18000/redoc
 
-## 负载均衡配置（可选）
+## Nginx配置
 
-如果需要使用负载均衡，可以配置 Nginx 或其他反向代理服务器，将请求分发到三个端口。
-
-参考 `config/nginx.conf` 中的配置示例。
+生产环境只代理18000端口。参考 `config/nginx.conf` 的独立连接限制和12小时同步请求超时，
+避免长转写占满Nginx并影响其它服务。
 
 ## 卸载服务
 
@@ -189,12 +187,12 @@ net stop WhisperAPI-18000 && net start WhisperAPI-18000
 2. **检查 Python 路径**
    - 确认 `install_nssm_services.bat` 中的 `PYTHON_EXE` 路径正确
    - 确认 Python 环境已安装所有依赖
+   - 更新代码后执行 `pip install -r requirements.txt`，确保已安装 `psutil`
+   - 确认安装的是支持CUDA的PyTorch，`/health` 必须显示 `model_loaded: true`
 
 3. **检查端口占用**
    ```cmd
    netstat -ano | findstr :18000
-   netstat -ano | findstr :18001
-   netstat -ano | findstr :18002
    ```
 
 4. **手动测试启动脚本**

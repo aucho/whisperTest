@@ -31,9 +31,9 @@ def create_gradio_app():
         with gr.Row():
             audio_input = gr.Audio(label="上传音频文件", type="filepath")
             model_dropdown = gr.Dropdown(
-                choices=["tiny", "base", "small", "medium", "large"],
-                value="base",
-                label="选择模型"
+                choices=["turbo"],
+                value="turbo",
+                label="模型（固定 turbo）"
             )
             language_dropdown = gr.Dropdown(
                 choices=["自动检测", "英语", "西班牙语"],
@@ -56,4 +56,3 @@ def create_gradio_app():
         )
 
     return app
-

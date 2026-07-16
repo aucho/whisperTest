@@ -1,263 +1,284 @@
-"""
-FastAPI HTTP API 模块
-提供 RESTful API 接口
-"""
+"""FastAPI 接口：文件持久化、有界队列及独立 Whisper Worker。"""
 
-from pathlib import Path
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
-from fastapi.responses import JSONResponse, FileResponse
-from fastapi.middleware.cors import CORSMiddleware
-import os
-import json
-import sys
-import tempfile
-from typing import Optional, Dict
-import torch
+from __future__ import annotations
+
 import asyncio
+import json
+import os
+import re
+import shutil
+import tempfile
+import time
+import uuid
+from pathlib import Path
+from typing import Optional
 
-# 流式写盘的分块大小（1MB），避免将整个音频一次性读入内存
-_UPLOAD_CHUNK_SIZE = 1024 * 1024
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
 
+from src.core import get_language_display
+from src.task_coordinator import DuplicateTaskError, QueueFullError, TaskCoordinator
 
-async def _save_upload_to_path(file: UploadFile, dest_path: str):
-    """分块将上传文件写入磁盘，降低大文件的内存峰值。"""
-    with open(dest_path, "wb") as out:
-        while True:
-            chunk = await file.read(_UPLOAD_CHUNK_SIZE)
-            if not chunk:
-                break
-            out.write(chunk)
-
-# 添加项目根目录到 Python 路径
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from src.core import process_audio, get_language_display, release_model, trim_process_memory
-
-TASK_STATUS = {}
-RUNNING_TASKS: Dict[str, asyncio.Task] = {}
-# 记录已调度清理的任务，避免重复轮询时反复创建清理协程
-_STATUS_CLEANUP_SCHEDULED: set = set()
-TASK_DIR = Path("./storage/tasks")
+UPLOAD_BLOCK_SIZE = 1024 * 1024
+TASK_DIR = Path(os.environ.get("WHISPER_TASK_DIR", "./storage/tasks")).resolve()
 STATUS_RETENTION_SECONDS = 3600
 TASK_FILE_RETENTION_SECONDS = 86400
+EFFECTIVE_MODEL_NAME = "turbo"
+TASK_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 
 
-def _read_int_env(name: str, default: int) -> int:
+def _env_int(name: str, default: int, minimum: int = 0) -> int:
     try:
-        return max(0, int(os.environ.get(name, str(default))))
+        return max(minimum, int(os.environ.get(name, str(default))))
     except (TypeError, ValueError):
         return default
 
 
-# 空闲多少秒后卸载已缓存的模型并归还内存。0 表示任务一空闲就立即卸载。
-# 卸载后下次请求会重新加载模型（有冷启动开销），用内存换常驻占用。
-MODEL_IDLE_TIMEOUT = _read_int_env("WHISPER_MODEL_IDLE_TIMEOUT", 60)
-_model_release_handle: Optional[asyncio.TimerHandle] = None
+QUEUE_LIMIT = _env_int("WHISPER_QUEUE_MAX_TASKS", 5, 1)
+CHUNK_TIMEOUT_SECONDS = _env_int("WHISPER_CHUNK_TIMEOUT_SECONDS", 7200, 60)
+WORKER_START_TIMEOUT_SECONDS = _env_int("WHISPER_WORKER_START_TIMEOUT_SECONDS", 1800, 60)
+MAX_UPLOAD_BYTES = _env_int("WHISPER_MAX_UPLOAD_BYTES", 20 * 1024**3, 1)
+MIN_FREE_DISK_GB = _env_int("WHISPER_MIN_FREE_DISK_GB", 20, 0)
+WORKER_MAX_RSS_GROWTH_MB = _env_int("WHISPER_WORKER_MAX_RSS_GROWTH_MB", 2048, 128)
+
+TASK_STATUS: dict[str, dict] = {}
+_STATUS_CLEANUP_SCHEDULED: set[str] = set()
 
 
-def _cancel_idle_model_release():
-    """有新任务进入时取消待执行的模型卸载。"""
-    global _model_release_handle
-    if _model_release_handle is not None:
-        _model_release_handle.cancel()
-        _model_release_handle = None
+def _sanitize_status(data: dict) -> dict:
+    clean = dict(data)
+    clean.pop("plain_text", None)
+    clean.pop("timestamped_text", None)
+    return clean
 
 
-def _do_idle_model_release():
-    global _model_release_handle
-    _model_release_handle = None
-    if RUNNING_TASKS:
-        return
-    # 在线程中卸载，避免释放大模型时阻塞事件循环
-    asyncio.create_task(asyncio.to_thread(release_model))
-
-
-def _schedule_idle_model_release():
-    """当没有运行中的任务时，调度一次（防抖的）模型卸载。"""
-    global _model_release_handle
-    if RUNNING_TASKS:
-        return
+def _atomic_write_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        return
-    _cancel_idle_model_release()
-    _model_release_handle = loop.call_later(MODEL_IDLE_TIMEOUT, _do_idle_model_release)
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            json.dump(data, output, ensure_ascii=False)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temp_name, path)
+    except Exception:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
 
 
-async def _cleanup_task_status_after(task_step_id: str, delay_seconds: int):
+def update_task_status(task_id: str, **fields) -> None:
+    fields = _sanitize_status(fields)
+    current = TASK_STATUS.setdefault(task_id, {})
+    current.update(fields)
+    current["updated_at"] = time.time()
+    clean = _sanitize_status(current)
+    TASK_STATUS[task_id] = clean
+    _atomic_write_json(TASK_DIR / task_id / "status.json", clean)
+
+
+def get_task_status(task_id: str) -> Optional[dict]:
+    if task_id in TASK_STATUS:
+        return _sanitize_status(TASK_STATUS[task_id])
+    path = TASK_DIR / task_id / "status.json"
+    if not path.exists():
+        return None
     try:
-        await asyncio.sleep(delay_seconds)
+        status = _sanitize_status(json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, json.JSONDecodeError):
+        return None
+    TASK_STATUS[task_id] = status
+    _schedule_status_cleanup(task_id)
+    return status
+
+
+async def _cleanup_status_after(task_id: str) -> None:
+    try:
+        await asyncio.sleep(STATUS_RETENTION_SECONDS)
     finally:
-        TASK_STATUS.pop(task_step_id, None)
-        _STATUS_CLEANUP_SCHEDULED.discard(task_step_id)
+        TASK_STATUS.pop(task_id, None)
+        _STATUS_CLEANUP_SCHEDULED.discard(task_id)
 
 
-def _schedule_status_cleanup(task_step_id: str, delay_seconds: int = STATUS_RETENTION_SECONDS):
-    """安全地调度内存状态清理（仅在有运行中的事件循环时生效，且不重复调度）。"""
-    if task_step_id in _STATUS_CLEANUP_SCHEDULED:
+def _schedule_status_cleanup(task_id: str) -> None:
+    if task_id in _STATUS_CLEANUP_SCHEDULED:
         return
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return
-    _STATUS_CLEANUP_SCHEDULED.add(task_step_id)
-    loop.create_task(_cleanup_task_status_after(task_step_id, delay_seconds))
+    _STATUS_CLEANUP_SCHEDULED.add(task_id)
+    loop.create_task(_cleanup_status_after(task_id))
 
 
-async def _cleanup_old_task_files_loop():
-    import time
-    import shutil
+coordinator = TaskCoordinator(
+    update_status=update_task_status,
+    queue_limit=QUEUE_LIMIT,
+    chunk_timeout=CHUNK_TIMEOUT_SECONDS,
+    rss_growth_limit_mb=WORKER_MAX_RSS_GROWTH_MB,
+)
+
+
+def _validate_task_id(task_id: str) -> None:
+    if not TASK_ID_PATTERN.fullmatch(task_id):
+        raise HTTPException(status_code=400, detail="task_step_id 只能包含字母、数字、点、下划线和横线，最长128字符")
+
+
+def _safe_upload_name(filename: Optional[str]) -> str:
+    name = Path(filename or "audio.bin").name
+    return f"source-{name or 'audio.bin'}"
+
+
+def _ensure_disk_space() -> None:
+    TASK_DIR.mkdir(parents=True, exist_ok=True)
+    free = shutil.disk_usage(TASK_DIR).free
+    if free < MIN_FREE_DISK_GB * 1024**3:
+        raise HTTPException(status_code=503, detail=f"任务磁盘剩余空间不足 {MIN_FREE_DISK_GB}GB")
+
+
+async def _save_upload(file: UploadFile, destination: Path) -> int:
+    _ensure_disk_space()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    written = 0
+    try:
+        with open(destination, "wb") as output:
+            while True:
+                block = await file.read(UPLOAD_BLOCK_SIZE)
+                if not block:
+                    break
+                written += len(block)
+                if written > MAX_UPLOAD_BYTES:
+                    raise HTTPException(status_code=413, detail="上传文件超过服务限制")
+                output.write(block)
+                if written % (256 * 1024**2) < UPLOAD_BLOCK_SIZE:
+                    _ensure_disk_space()
+        return written
+    except BaseException:
+        try:
+            destination.unlink()
+        except OSError:
+            pass
+        raise
+    finally:
+        await file.close()
+
+
+def _language_code(language: Optional[str]) -> Optional[str]:
+    return language if language in {"en", "es"} else None
+
+
+def _language_display(language: Optional[str]) -> str:
+    return get_language_display(language) if language else "自动检测"
+
+
+def _make_task_payload(
+    task_id: str,
+    task_dir: Path,
+    audio_path: Path,
+    requested_model: str,
+    language: Optional[str],
+    include_timestamps: bool,
+    initial_prompt: Optional[str],
+    async_task: bool,
+) -> dict:
+    return {
+        "type": "transcribe",
+        "task_id": task_id,
+        "task_dir": str(task_dir),
+        "audio_path": str(audio_path),
+        "result_path": str(task_dir / "result.txt"),
+        "timestamp_path": str(task_dir / "result_with_timestamps.txt") if include_timestamps else None,
+        "cancel_path": str(task_dir / ".cancel"),
+        "requested_model_name": requested_model,
+        "effective_model_name": EFFECTIVE_MODEL_NAME,
+        "language": _language_code(language),
+        "include_timestamps": include_timestamps,
+        "initial_prompt": initial_prompt,
+        "async_task": async_task,
+        "attempt": 1,
+    }
+
+
+def _persist_task(task: dict) -> None:
+    _atomic_write_json(Path(task["task_dir"]) / "task.json", task)
+
+
+async def _cleanup_sync_task_when_done(
+    task_id: str, task_dir: Path, future: asyncio.Future
+) -> None:
+    try:
+        await asyncio.shield(future)
+    except (asyncio.CancelledError, Exception):
+        pass
+    finally:
+        shutil.rmtree(task_dir, ignore_errors=True)
+        TASK_STATUS.pop(task_id, None)
+
+
+async def _recover_tasks() -> None:
+    if not TASK_DIR.exists():
+        return
+    for task_path in TASK_DIR.iterdir():
+        if not task_path.is_dir():
+            continue
+        status_path = task_path / "status.json"
+        payload_path = task_path / "task.json"
+        try:
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not payload_path.exists():
+            if status.get("status") in {"uploading", "pending", "queued", "processing"}:
+                task_id = task_path.name
+                update_task_status(
+                    task_id,
+                    status="failed",
+                    stage="interrupted",
+                    message="旧任务缺少持久化任务信息，无法在服务重启后恢复",
+                )
+            continue
+        try:
+            task = json.loads(payload_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        task_id = task.get("task_id")
+        if not task_id or status.get("status") not in {"queued", "processing", "uploading"}:
+            continue
+        if not task.get("async_task"):
+            update_task_status(task_id, status="failed", stage="interrupted", message="同步请求因服务重启中断")
+            continue
+        task["attempt"] = int(status.get("attempt", task.get("attempt", 1)))
+        if coordinator.recover(task):
+            _persist_task(task)
+            update_task_status(task_id, status="queued", stage="recovered", message="服务重启后任务已重新排队", attempt=task["attempt"])
+        else:
+            update_task_status(task_id, status="failed", stage="failed", message="任务已超过最大恢复次数或恢复队列已满")
+
+
+async def _cleanup_old_tasks_loop() -> None:
     while True:
         await asyncio.sleep(3600)
-        try:
-            if not TASK_DIR.exists():
+        now = time.time()
+        if not TASK_DIR.exists():
+            continue
+        for task_path in TASK_DIR.iterdir():
+            if not task_path.is_dir():
                 continue
-            now = time.time()
-            for task_path in TASK_DIR.iterdir():
-                if not task_path.is_dir():
+            try:
+                status_path = task_path / "status.json"
+                status = json.loads(status_path.read_text(encoding="utf-8")) if status_path.exists() else {}
+                if status.get("status") in {"uploading", "queued", "processing"}:
                     continue
-                try:
-                    mtime = task_path.stat().st_mtime
-                    if now - mtime > TASK_FILE_RETENTION_SECONDS:
-                        shutil.rmtree(task_path)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                if now - task_path.stat().st_mtime > TASK_FILE_RETENTION_SECONDS:
+                    shutil.rmtree(task_path)
+            except Exception:
+                continue
 
 
-def _sanitize_status(status_data: dict) -> dict:
-    """剔除 status 中的大段转写正文，避免内存与 status.json 膨胀。"""
-    sanitized = dict(status_data)
-    sanitized.pop("timestamped_text", None)
-    sanitized.pop("plain_text", None)
-    return sanitized
-
-
-def update_task_status(task_step_id: str, **fields):
-    fields = _sanitize_status(fields)
-    TASK_STATUS.setdefault(task_step_id, {})
-    TASK_STATUS[task_step_id].update(fields)
-    clean_status = _sanitize_status(TASK_STATUS[task_step_id])
-    TASK_STATUS[task_step_id] = clean_status
-    task_path = TASK_DIR / task_step_id
-    task_path.mkdir(parents=True, exist_ok=True)
-    (task_path / "status.json").write_text(
-        json.dumps(clean_status, ensure_ascii=False), encoding="utf-8"
-    )
-
-
-def get_task_status(task_step_id: str) -> dict:
-    """获取任务状态，优先从内存读取，如果不存在则从文件读取"""
-    # 先尝试从内存读取
-    if task_step_id in TASK_STATUS:
-        clean_status = _sanitize_status(TASK_STATUS[task_step_id])
-        TASK_STATUS[task_step_id] = clean_status
-        return clean_status
-
-    # 从文件读取
-    task_path = TASK_DIR / task_step_id
-    status_file = task_path / "status.json"
-
-    if status_file.exists():
-        try:
-            status_data = _sanitize_status(
-                json.loads(status_file.read_text(encoding="utf-8"))
-            )
-            # 更新内存中的状态，并调度清理，避免轮询历史任务导致内存只增不减
-            TASK_STATUS[task_step_id] = status_data
-            _schedule_status_cleanup(task_step_id)
-            return status_data
-        except Exception:
-            pass
-
-    # 如果都不存在，返回 None
-    return None
-
-
-async def run_transcribe_task(
-    audio_path: str,
-    task_step_id: str,
-    model_name: str,
-    language_choice: str,
-    include_timestamps: bool,
-    initial_prompt: Optional[str] = None,
-):
-    """后台任务：执行转录并保存结果"""
-    try:
-        # 更新状态为处理中
-        update_task_status(
-            task_step_id,
-            status="processing",
-            message="正在处理音频文件...",
-        )
-
-        # 在线程池中执行同步的转录任务，避免阻塞事件循环
-        plain_text, timestamped_text, detected_language = await asyncio.to_thread(
-            process_audio,
-            audio_path,
-            model_name=model_name,
-            language_choice=language_choice,
-            verbose=False,
-            initial_prompt=initial_prompt,
-        )
-
-        # 保存结果到文件
-        task_path = TASK_DIR / task_step_id
-        task_path.mkdir(parents=True, exist_ok=True)
-
-        # 保存纯文本
-        (task_path / "result.txt").write_text(plain_text, encoding="utf-8")
-
-        # 如果包含时间戳，保存带时间戳的文本
-        if include_timestamps:
-            (task_path / "result_with_timestamps.txt").write_text(
-                timestamped_text, encoding="utf-8"
-            )
-
-        # 更新状态为完成
-        update_task_status(
-            task_step_id,
-            status="completed",
-            message="转录完成",
-            language_detected=detected_language,
-            language_detected_display=get_language_display(detected_language),
-        )
-
-    except asyncio.CancelledError:
-        # 任务被取消，清理状态
-        update_task_status(
-            task_step_id,
-            status="cancelled",
-            message="任务已被终止",
-        )
-        raise
-    except Exception as e:
-        # 更新状态为失败
-        update_task_status(
-            task_step_id,
-            status="failed",
-            message=f"转录失败: {str(e)}",
-            error=str(e),
-        )
-    finally:
-        cleanup_resources()
-        RUNNING_TASKS.pop(task_step_id, None)
-        _schedule_status_cleanup(task_step_id, STATUS_RETENTION_SECONDS)
-        # 没有其它任务在排队时，调度空闲卸载模型以释放常驻内存
-        _schedule_idle_model_release()
-
-
-def cleanup_resources():
-    """清理内存和显存，尽量归还操作系统。"""
-    trim_process_memory()
-
-
-# 创建 FastAPI 应用
-api_app = FastAPI(title="音频文字提取 API", description="Whisper 音频转文字 API 服务")
-
-# 添加 CORS 支持
+api_app = FastAPI(title="音频文字提取 API", description="Whisper turbo 音频转文字 API")
 api_app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -268,424 +289,234 @@ api_app.add_middleware(
 
 
 @api_app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(_cleanup_old_task_files_loop())
+async def startup_event() -> None:
+    TASK_DIR.mkdir(parents=True, exist_ok=True)
+    await coordinator.start()
+    await coordinator.wait_until_ready(WORKER_START_TIMEOUT_SECONDS)
+    await _recover_tasks()
+    asyncio.create_task(_cleanup_old_tasks_loop())
+
+
+@api_app.on_event("shutdown")
+async def shutdown_event() -> None:
+    await coordinator.stop()
 
 
 @api_app.get("/")
 async def root():
-    """API 根路径，返回 API 信息"""
     return {
         "message": "音频文字提取 API",
-        "version": "1.0",
+        "version": "2.0",
+        "effective_model_name": EFFECTIVE_MODEL_NAME,
         "endpoints": {
-            "/transcribe": "POST - 上传音频文件进行转写",
-            "/transcribe_start": "POST - 启动异步转录任务",
+            "/transcribe": "POST - 同步上传并等待转写",
+            "/transcribe_start": "POST - 异步启动转写任务",
             "/task/{task_step_id}/status": "GET - 查询任务状态",
             "/task/{task_step_id}/cancel": "POST - 取消任务",
             "/task/{task_step_id}/download/{file_type}": "GET - 下载任务文件",
-            "/health": "GET - 健康检查",
+            "/health": "GET - 存活和Worker就绪状态",
         },
     }
 
 
 @api_app.get("/health")
 async def health_check():
-    """健康检查端点"""
-    return {
-        "status": "healthy",
-        "device": "cuda" if torch.cuda.is_available() else "cpu",
-    }
+    worker = coordinator.snapshot()
+    ready = worker["worker_alive"] and worker["model_loaded"] and not worker["start_error"]
+    return JSONResponse(
+        status_code=200 if ready else 503,
+        content={"status": "healthy" if ready else "not_ready", "device": "cuda", **worker},
+    )
 
 
-# 短的转写 一次生成并返回结果
 @api_app.post("/transcribe")
 async def transcribe_audio(
     file: UploadFile = File(..., description="音频文件"),
-    model_name: str = Form(
-        "base", description="模型名称: tiny, base, small, medium, large"
-    ),
-    language: Optional[str] = Form(
-        None, description="语言代码: en(英语), es(西班牙语), 或留空自动检测"
-    ),
-    include_timestamps: bool = Form(False, description="是否包含时间戳"),
-    initial_prompt: Optional[str] = Form(
-        None,
-        description="转写引导提示词，留空则使用内置电商直播风格默认提示",
-    ),
+    model_name: str = Form("turbo", description="兼容参数，实际固定使用 turbo"),
+    language: Optional[str] = Form(None),
+    include_timestamps: bool = Form(False),
+    initial_prompt: Optional[str] = Form(None),
 ):
-    """
-    转写音频文件为文字
-
-    参数:
-    - file: 音频文件 (支持 mp3, wav, m4a 等格式)
-    - model_name: Whisper 模型名称 (tiny, base, small, medium, large)
-    - language: 语言代码 (en, es 等)，留空则自动检测
-    - include_timestamps: 是否在结果中包含时间戳信息
-    - initial_prompt: 转写引导提示词，用于引导标点与话术风格
-    """
+    if not coordinator.has_capacity():
+        raise HTTPException(status_code=429, detail="Whisper任务队列已满")
+    task_id = f"sync-{uuid.uuid4().hex}"
+    task_dir = TASK_DIR / task_id
+    audio_path = task_dir / _safe_upload_name(file.filename)
+    future: Optional[asyncio.Future] = None
+    deferred_cleanup = False
+    update_task_status(task_id, status="uploading", stage="uploading", message="正在保存上传文件", async_task=False)
     try:
-        # 验证模型名称
-        valid_models = [
-            "tiny",
-            "base",
-            "small",
-            "medium",
-            "large",
-            "turbo",
-            "tiny.en",
-            "base.en",
-            "small.en",
-            "medium.en",
-        ]
-        if model_name not in valid_models:
-            raise HTTPException(
-                status_code=400,
-                detail=f"无效的模型名称。可选值: {', '.join(valid_models)}",
-            )
-
-        # 有新任务进入，取消待执行的模型卸载
-        _cancel_idle_model_release()
-
-        # 保存上传的文件到临时目录（流式写盘，避免大文件占满内存）
-        fd, tmp_path = tempfile.mkstemp(suffix=os.path.splitext(file.filename)[1])
-        os.close(fd)
-        await _save_upload_to_path(file, tmp_path)
-
-        try:
-            # 将语言代码转换为中文选项（用于 process_audio 函数）
-            language_map_reverse = {
-                "en": "英语",
-                "es": "西班牙语",
-            }
-            language_choice = (
-                "自动检测"
-                if language is None
-                else language_map_reverse.get(language, "自动检测")
-            )
-
-            # 在线程池中执行同步的转录任务，避免阻塞事件循环
-            plain_text, timestamped_text, detected_language = await asyncio.to_thread(
-                process_audio,
-                tmp_path,
-                model_name=model_name,
-                language_choice=language_choice,
-                verbose=False,
-                initial_prompt=initial_prompt,
-            )
-
-            # 构建响应
-            response = {
-                "success": True,
-                "text": plain_text,
-                "language_detected": detected_language,
-                "language_detected_display": get_language_display(detected_language),
-            }
-
-            if include_timestamps:
-                response["text_with_timestamps"] = timestamped_text
-
-            return JSONResponse(content=response)
-
-        finally:
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
-            cleanup_resources()
-            # 同步请求结束后调度空闲卸载，释放常驻模型内存
-            _schedule_idle_model_release()
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"处理音频时出错: {str(e)}")
+        await _save_upload(file, audio_path)
+        task = _make_task_payload(task_id, task_dir, audio_path, model_name, language, include_timestamps, initial_prompt, False)
+        _persist_task(task)
+        update_task_status(
+            task_id,
+            status="queued",
+            stage="queued",
+            message="任务已进入队列",
+            requested_model_name=model_name,
+            effective_model_name=EFFECTIVE_MODEL_NAME,
+            attempt=1,
+            async_task=False,
+        )
+        future = coordinator.enqueue(task, wait_for_result=True)
+        outcome = await asyncio.shield(future)
+        if outcome.get("status") != "completed":
+            raise HTTPException(status_code=500, detail=outcome.get("error", "转录未完成"))
+        text = (task_dir / "result.txt").read_text(encoding="utf-8").strip()
+        detected = outcome.get("language_detected")
+        response = {
+            "success": True,
+            "text": text,
+            "language_detected": detected,
+            "language_detected_display": get_language_display(detected),
+        }
+        if include_timestamps:
+            response["text_with_timestamps"] = (task_dir / "result_with_timestamps.txt").read_text(encoding="utf-8").strip()
+        return JSONResponse(content=response)
+    except (QueueFullError, DuplicateTaskError) as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    except asyncio.CancelledError:
+        if future is not None:
+            coordinator.cancel(task_id)
+            deferred_cleanup = True
+            asyncio.create_task(_cleanup_sync_task_when_done(task_id, task_dir, future))
+        raise
+    finally:
+        if not deferred_cleanup:
+            shutil.rmtree(task_dir, ignore_errors=True)
+            TASK_STATUS.pop(task_id, None)
 
 
-# 调用后开始转写 并保存结果到本地文件 长转写
 @api_app.post("/transcribe_start")
 async def transcribe_start(
     file: UploadFile = File(..., description="音频文件"),
-    model_name: str = Form(
-        "base", description="模型名称: tiny, base, small, medium, large"
-    ),
-    language: Optional[str] = Form(
-        None, description="语言代码: en(英语), es(西班牙语), 或留空自动检测"
-    ),
-    include_timestamps: bool = Form(False, description="是否包含时间戳"),
-    task_step_id: str = Form(..., description="任务步骤ID 用于查询文件保存路径"),
-    initial_prompt: Optional[str] = Form(
-        None,
-        description="转写引导提示词，留空则使用内置电商直播风格默认提示",
-    ),
+    model_name: str = Form("turbo", description="兼容参数，实际固定使用 turbo"),
+    language: Optional[str] = Form(None),
+    include_timestamps: bool = Form(False),
+    task_step_id: str = Form(...),
+    initial_prompt: Optional[str] = Form(None),
 ):
-    """
-    启动异步转录任务
-
-    调用后立即返回，转录任务在后台执行。
-    可以通过 task_step_id 查询任务状态和结果。
-    """
+    _validate_task_id(task_step_id)
+    task_dir = TASK_DIR / task_step_id
+    if task_dir.exists() or task_step_id in coordinator.known_ids:
+        raise HTTPException(status_code=409, detail=f"任务 {task_step_id} 已存在")
+    if not coordinator.has_capacity():
+        raise HTTPException(status_code=429, detail="Whisper任务队列已满")
+    audio_path = task_dir / _safe_upload_name(file.filename)
+    update_task_status(task_step_id, status="uploading", stage="uploading", message="正在保存上传文件", async_task=True)
     try:
-        # 验证模型名称
-        valid_models = [
-            "tiny",
-            "base",
-            "small",
-            "medium",
-            "large",
-            "turbo",
-            "tiny.en",
-            "base.en",
-            "small.en",
-            "medium.en",
-        ]
-        if model_name not in valid_models:
-            raise HTTPException(
-                status_code=400,
-                detail=f"无效的模型名称。可选值: {', '.join(valid_models)}",
-            )
-
-        # 创建任务目录
-        task_path = TASK_DIR / task_step_id
-        task_path.mkdir(parents=True, exist_ok=True)
-
-        # 保存上传的文件到任务目录（流式写盘，避免大文件占满内存）
-        audio_path = task_path / file.filename
-        await _save_upload_to_path(file, str(audio_path))
-
-        # 将语言代码转换为中文选项（用于 process_audio 函数）
-        language_map_reverse = {
-            "en": "英语",
-            "es": "西班牙语",
-        }
-        language_choice = (
-            "自动检测"
-            if language is None
-            else language_map_reverse.get(language, "自动检测")
-        )
-
-        # 初始化任务状态
+        size = await _save_upload(file, audio_path)
+        task = _make_task_payload(task_step_id, task_dir, audio_path, model_name, language, include_timestamps, initial_prompt, True)
+        _persist_task(task)
         update_task_status(
             task_step_id,
-            status="pending",
-            message="任务已创建，等待处理...",
-            model_name=model_name,
+            status="queued",
+            stage="queued",
+            message="任务已进入队列",
+            requested_model_name=model_name,
+            effective_model_name=EFFECTIVE_MODEL_NAME,
             language=language or "auto",
-            language_display=language_choice,
+            language_display=_language_display(language),
+            upload_bytes=size,
+            attempt=1,
+            async_task=True,
         )
-
-        # 有新任务进入，取消待执行的模型卸载
-        _cancel_idle_model_release()
-
-        # 将转录任务添加到事件循环
-        task = asyncio.create_task(
-            run_transcribe_task(
-                str(audio_path),
-                task_step_id,
-                model_name,
-                language_choice,
-                include_timestamps,
-                initial_prompt,
-            )
-        )
-        RUNNING_TASKS[task_step_id] = task
-
-        # 立即返回响应
-        return JSONResponse(
-            content={
-                "success": True,
-                "task_step_id": task_step_id,
-                "message": "转录任务已启动",
-                "status": "pending",
-                "language": language or "auto",
-                "language_display": language_choice,
-            }
-        )
-
-    except HTTPException:
+        coordinator.enqueue(task)
+    except (QueueFullError, DuplicateTaskError) as exc:
+        shutil.rmtree(task_dir, ignore_errors=True)
+        TASK_STATUS.pop(task_step_id, None)
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    except asyncio.CancelledError:
+        shutil.rmtree(task_dir, ignore_errors=True)
+        TASK_STATUS.pop(task_step_id, None)
         raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"启动转录任务时出错: {str(e)}")
+    except Exception:
+        status = get_task_status(task_step_id) or {}
+        if status.get("status") == "uploading":
+            shutil.rmtree(task_dir, ignore_errors=True)
+            TASK_STATUS.pop(task_step_id, None)
+        raise
+    return JSONResponse(
+        content={
+            "success": True,
+            "task_step_id": task_step_id,
+            "message": "转录任务已进入队列",
+            "status": "queued",
+            "language": language or "auto",
+            "language_display": _language_display(language),
+            "effective_model_name": EFFECTIVE_MODEL_NAME,
+        }
+    )
 
 
 @api_app.get("/task/{task_step_id}/status")
 async def get_task_status_endpoint(task_step_id: str):
-    """
-    查询任务状态
-
-    参数:
-    - task_step_id: 任务步骤ID
-
-    返回:
-    - status: 任务状态 (pending, processing, completed, failed)
-    - message: 状态消息
-    - 其他任务相关信息
-    """
-    task_status = get_task_status(task_step_id)
-
-    if task_status is None:
-        raise HTTPException(status_code=404, detail=f"任务 {task_step_id} 不存在")
-
-    # 检查任务目录是否存在
+    status = get_task_status(task_step_id)
     task_path = TASK_DIR / task_step_id
-    if not task_path.exists():
+    if status is None or not task_path.exists():
         raise HTTPException(status_code=404, detail=f"任务 {task_step_id} 不存在")
-
-    # 构建响应，包含文件信息
-    response = {"task_step_id": task_step_id, **task_status}
-
-    # 添加文件列表信息
+    response = {"task_step_id": task_step_id, **status}
     files = []
-    if (task_path / "result.txt").exists():
-        files.append(
-            {
-                "name": "result.txt",
-                "type": "result",
-                "description": "转录结果（纯文本）",
-            }
-        )
-    if (task_path / "result_with_timestamps.txt").exists():
-        files.append(
-            {
-                "name": "result_with_timestamps.txt",
-                "type": "result_with_timestamps",
-                "description": "转录结果（带时间戳）",
-            }
-        )
-
-    # 查找原始音频文件
-    audio_files = [
-        f
-        for f in task_path.iterdir()
-        if f.is_file()
-        and f.suffix.lower() in [".mp3", ".wav", ".m4a", ".flac", ".ogg", ".mp4"]
-    ]
-    for audio_file in audio_files:
-        files.append(
-            {"name": audio_file.name, "type": "audio", "description": "原始音频文件"}
-        )
-
+    for name, kind, description in (
+        ("result.txt", "result", "转录结果（纯文本）"),
+        ("result_with_timestamps.txt", "result_with_timestamps", "转录结果（带时间戳）"),
+    ):
+        if (task_path / name).exists():
+            files.append({"name": name, "type": kind, "description": description})
+    audio_path = None
+    payload_path = task_path / "task.json"
+    try:
+        payload = json.loads(payload_path.read_text(encoding="utf-8"))
+        audio_path = Path(payload["audio_path"])
+    except (OSError, KeyError, json.JSONDecodeError):
+        pass
+    if audio_path and audio_path.exists():
+        files.append({"name": audio_path.name, "type": "audio", "description": "原始音频文件"})
     response["files"] = files
-
     return JSONResponse(content=response)
 
 
 @api_app.post("/task/{task_step_id}/cancel")
 async def cancel_task(task_step_id: str):
-    """
-    取消正在进行的任务，并尝试释放资源
-    """
-    task_status = get_task_status(task_step_id)
-
-    if task_status is None:
+    status = get_task_status(task_step_id)
+    if status is None:
         raise HTTPException(status_code=404, detail=f"任务 {task_step_id} 不存在")
-
-    current_status = task_status.get("status")
-    if current_status in {"completed", "failed", "cancelled"}:
+    if status.get("status") in {"completed", "failed", "cancelled"}:
         return JSONResponse(
-            content={
-                "success": False,
-                "task_step_id": task_step_id,
-                "status": current_status,
-                "message": "任务已结束，无法取消",
-            }
+            content={"success": False, "task_step_id": task_step_id, "status": status["status"], "message": "任务已结束，无法取消"}
         )
-
-    task = RUNNING_TASKS.get(task_step_id)
-    if task is None:
-        # 没有记录运行中的任务，直接标记为已取消
-        update_task_status(
-            task_step_id,
-            status="cancelled",
-            message="任务状态已更新为已取消",
-        )
-        cleanup_resources()
-        return JSONResponse(
-            content={
-                "success": True,
-                "task_step_id": task_step_id,
-                "status": "cancelled",
-                "message": "任务已取消",
-            }
-        )
-
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
-
-    RUNNING_TASKS.pop(task_step_id, None)
-    cleanup_resources()
-
-    updated_status = get_task_status(task_step_id) or {}
-    return JSONResponse(
-        content={
-            "success": True,
-            "task_step_id": task_step_id,
-            "status": updated_status.get("status", "cancelled"),
-            "message": updated_status.get("message", "任务已取消"),
-        }
-    )
+    outcome = coordinator.cancel(task_step_id)
+    if outcome == "cancelled":
+        update_task_status(task_step_id, status="cancelled", stage="cancelled", message="排队任务已取消")
+    elif outcome == "cancelling":
+        update_task_status(task_step_id, stage="cancelling", message="将在当前分块结束后取消")
+    else:
+        update_task_status(task_step_id, status="cancelled", stage="cancelled", message="任务已取消")
+    return JSONResponse(content={"success": True, "task_step_id": task_step_id, "status": "cancelled" if outcome != "cancelling" else "processing", "message": "取消请求已接受"})
 
 
 @api_app.get("/task/{task_step_id}/download/{file_type}")
 async def download_task_file(task_step_id: str, file_type: str):
-    """
-    下载任务文件
-
-    参数:
-    - task_step_id: 任务步骤ID
-    - file_type: 文件类型
-        - "result": 下载 result.txt（纯文本结果）
-        - "result_with_timestamps": 下载 result_with_timestamps.txt（带时间戳的结果）
-        - "audio": 下载原始音频文件（如果有多个，返回第一个）
-        - 或者直接指定文件名
-
-    返回:
-    - 文件内容
-    """
     task_path = TASK_DIR / task_step_id
-
     if not task_path.exists():
         raise HTTPException(status_code=404, detail=f"任务 {task_step_id} 不存在")
-
-    file_path = None
-    filename = None
-
-    # 根据文件类型确定文件路径
     if file_type == "result":
         file_path = task_path / "result.txt"
-        filename = "result.txt"
     elif file_type == "result_with_timestamps":
         file_path = task_path / "result_with_timestamps.txt"
-        filename = "result_with_timestamps.txt"
     elif file_type == "audio":
-        # 查找音频文件
-        audio_files = [
-            f
-            for f in task_path.iterdir()
-            if f.is_file()
-            and f.suffix.lower() in [".mp3", ".wav", ".m4a", ".flac", ".ogg", ".mp4"]
-        ]
-        if not audio_files:
-            raise HTTPException(
-                status_code=404, detail=f"任务 {task_step_id} 中没有找到音频文件"
-            )
-        file_path = audio_files[0]
-        filename = file_path.name
+        try:
+            payload = json.loads((task_path / "task.json").read_text(encoding="utf-8"))
+            file_path = Path(payload["audio_path"])
+        except (OSError, KeyError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=404, detail="原始音频不存在") from exc
     else:
-        # 直接使用 file_type 作为文件名
-        file_path = task_path / file_type
-        filename = file_type
-
-        # 安全检查：确保文件路径在任务目录内，防止路径遍历攻击
+        file_path = task_path / Path(file_type).name
         try:
             file_path.resolve().relative_to(task_path.resolve())
-        except ValueError:
-            raise HTTPException(status_code=400, detail="无效的文件路径")
-
-    # 检查文件是否存在
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="无效文件路径") from exc
     if not file_path.exists() or not file_path.is_file():
-        raise HTTPException(status_code=404, detail=f"文件 {filename} 不存在")
-
-    # 返回文件
-    return FileResponse(
-        path=str(file_path), filename=filename, media_type="application/octet-stream"
-    )
+        raise HTTPException(status_code=404, detail=f"文件 {file_path.name} 不存在")
+    return FileResponse(path=str(file_path), filename=file_path.name, media_type="application/octet-stream")
