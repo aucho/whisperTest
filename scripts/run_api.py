@@ -41,9 +41,9 @@ def main():
     print("=" * 60)
     print(f"FastAPI 服务启动中... (端口: {args.port})")
     print("=" * 60)
-    print(f"🔌 FastAPI HTTP API: http://{args.host}:{args.port}")
-    print(f"📚 API 文档 (Swagger): http://{args.host}:{args.port}/docs")
-    print(f"📖 API 文档 (ReDoc): http://{args.host}:{args.port}/redoc")
+    print(f"FastAPI HTTP API: http://{args.host}:{args.port}")
+    print(f"API 文档 (Swagger): http://{args.host}:{args.port}/docs")
+    print(f"API 文档 (ReDoc): http://{args.host}:{args.port}/redoc")
     print("=" * 60)
     
     uvicorn.run(
