@@ -1,19 +1,36 @@
 # Windows 部署指南
 
-本指南介绍如何在 Windows 系统上使用 NSSM（Non-Sucking Service Manager）将 Whisper API 服务部署为 Windows 服务，实现开机自启和负载均衡。
+本指南介绍如何在 Windows 系统上使用 NSSM（Non-Sucking Service Manager）将 Faster-Whisper API 服务部署为 Windows 服务，实现开机自启和负载均衡。
 
 ## 前置要求
 
 1. **Python 环境**
-   - Python 3.8 或更高版本
+   - Python 3.9 或更高版本
    - 已安装项目依赖（见 `requirements.txt`）
    - Conda 或 venv 虚拟环境
 
-2. **NSSM**
+2. **NVIDIA GPU 运行库**
+   - 生产推理固定使用 CUDA，不会自动回退到 CPU
+   - `faster-whisper==1.2.1` / `ctranslate2==4.8.1` 需要可加载的 CUDA 12 cuBLAS 与 cuDNN 9
+   - `nvidia-smi` 显示的 `CUDA Version: 13.1` 是驱动可支持的最高版本，不能证明上述 CUDA 12 DLL 与 cuDNN 9 已正确安装
+   - 启动服务前应确认 CUDA 12 与 cuDNN 9 的 DLL 目录已加入服务账户的系统 `PATH`
+
+3. **NSSM**
    - 下载地址：https://nssm.cc/download
    - 推荐下载最新版本的 Win64 版本
 
 ## 安装步骤
+
+### 0. 安装 Python 依赖
+
+在实际运行 NSSM 的 Conda/venv 环境中安装固定版本依赖：
+
+```cmd
+python -m pip install -r requirements.txt
+```
+
+首次启动会下载 Faster-Whisper turbo 模型。生产环境建议提前启动一次或预热模型，
+并将 `WHISPER_MODEL_CACHE_DIR` 指向服务账户可读写的固定目录。
 
 ### 1. 安装 NSSM
 
@@ -139,7 +156,9 @@ net stop WhisperAPI-18000 && net start WhisperAPI-18000
 - `logs\service_18000.log`
 
 18000服务会启动一个独立的 `WhisperTurboWorker` 子进程。主进程负责HTTP、状态与队列，
-子进程固定加载turbo并按1小时分块推理。
+子进程通过 Faster-Whisper 固定加载 turbo，以 `float16`、`beam_size=5` 按1小时分块推理。
+VAD 默认开启并过滤超过2秒的静音；如发现有效语音被过滤，可设置
+`WHISPER_VAD_ENABLED=false` 后重启服务。
 
 ## 访问服务
 
@@ -188,7 +207,11 @@ net stop WhisperAPI-18000 && net start WhisperAPI-18000
    - 确认 `install_nssm_services.bat` 中的 `PYTHON_EXE` 路径正确
    - 确认 Python 环境已安装所有依赖
    - 更新代码后执行 `pip install -r requirements.txt`，确保已安装 `psutil`
-   - 确认安装的是支持CUDA的PyTorch，`/health` 必须显示 `model_loaded: true`
+   - 确认服务账户的 `PATH` 能找到 CUDA 12 cuBLAS 与 cuDNN 9 DLL
+   - `/health` 必须显示 `model_loaded: true`、`backend: faster-whisper`、
+     `compute_type: float16` 和 `vad_enabled: true`
+   - 如出现 `cublas64_12.dll`、`cudnn64_9.dll` 或 CUDA 初始化错误，应先修复运行库，
+     不要改成 CPU 回退
 
 3. **检查端口占用**
    ```cmd

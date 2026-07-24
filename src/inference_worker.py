@@ -8,7 +8,15 @@ import traceback
 from multiprocessing.queues import Queue
 from pathlib import Path
 
-from src.core import WhisperEngine, transcribe_file_chunked
+from src.core import (
+    WHISPER_BACKEND,
+    WHISPER_COMPUTE_TYPE,
+    WHISPER_DEVICE_INDEX,
+    WHISPER_VAD_ENABLED,
+    WhisperEngine,
+    is_cuda_oom_error,
+    transcribe_file_chunked,
+)
 
 
 def _rss_bytes() -> int:
@@ -30,6 +38,10 @@ def worker_main(command_queue: Queue, event_queue: Queue, rss_growth_limit_mb: i
                 "type": "worker_ready",
                 "model_loaded": True,
                 "effective_model_name": "turbo",
+                "backend": WHISPER_BACKEND,
+                "compute_type": WHISPER_COMPUTE_TYPE,
+                "device_index": WHISPER_DEVICE_INDEX,
+                "vad_enabled": WHISPER_VAD_ENABLED,
                 "baseline_rss": baseline_rss,
             }
         )
@@ -97,7 +109,7 @@ def worker_main(command_queue: Queue, event_queue: Queue, rss_growth_limit_mb: i
                 {"type": "task_cancelled", "task_id": task_id, "event_at": time.time()}
             )
         except Exception as exc:
-            fatal_cuda_oom = "CUDA OOM" in str(exc)
+            fatal_cuda_oom = is_cuda_oom_error(exc)
             event_queue.put(
                 {
                     "type": "task_failed",

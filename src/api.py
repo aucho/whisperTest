@@ -17,7 +17,13 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
-from src.core import get_language_display
+from src.core import (
+    WHISPER_BACKEND,
+    WHISPER_COMPUTE_TYPE,
+    WHISPER_DEVICE_INDEX,
+    WHISPER_VAD_ENABLED,
+    get_language_display,
+)
 from src.task_coordinator import DuplicateTaskError, QueueFullError, TaskCoordinator
 
 UPLOAD_BLOCK_SIZE = 1024 * 1024
@@ -278,7 +284,7 @@ async def _cleanup_old_tasks_loop() -> None:
                 continue
 
 
-api_app = FastAPI(title="音频文字提取 API", description="Whisper turbo 音频转文字 API")
+api_app = FastAPI(title="音频文字提取 API", description="Faster-Whisper turbo 音频转文字 API")
 api_app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -325,7 +331,15 @@ async def health_check():
     ready = worker["worker_alive"] and worker["model_loaded"] and not worker["start_error"]
     return JSONResponse(
         status_code=200 if ready else 503,
-        content={"status": "healthy" if ready else "not_ready", "device": "cuda", **worker},
+        content={
+            "status": "healthy" if ready else "not_ready",
+            "device": "cuda",
+            "backend": WHISPER_BACKEND,
+            "compute_type": WHISPER_COMPUTE_TYPE,
+            "device_index": WHISPER_DEVICE_INDEX,
+            "vad_enabled": WHISPER_VAD_ENABLED,
+            **worker,
+        },
     )
 
 

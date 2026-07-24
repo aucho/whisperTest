@@ -1,4 +1,4 @@
-"""Whisper 核心处理：固定 turbo 常驻、按区间解码并增量输出。"""
+"""Faster-Whisper 核心处理：固定 turbo 常驻、按区间解码并增量输出。"""
 
 from __future__ import annotations
 
@@ -15,15 +15,9 @@ from pathlib import Path
 from typing import Callable, Optional
 
 import numpy as np
-import torch
-import whisper
-
-try:
-    from whisper.audio import SAMPLE_RATE as WHISPER_SAMPLE_RATE
-except Exception:  # pragma: no cover
-    WHISPER_SAMPLE_RATE = 16000
 
 logger = logging.getLogger(__name__)
+WHISPER_SAMPLE_RATE = 16000
 
 
 def _env_int(name: str, default: int, minimum: int = 1) -> int:
@@ -33,8 +27,22 @@ def _env_int(name: str, default: int, minimum: int = 1) -> int:
         return default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 EFFECTIVE_MODEL_NAME = os.environ.get("WHISPER_MODEL", "turbo") or "turbo"
 WHISPER_DEVICE = os.environ.get("WHISPER_DEVICE", "cuda").lower()
+WHISPER_COMPUTE_TYPE = os.environ.get("WHISPER_COMPUTE_TYPE", "float16") or "float16"
+WHISPER_DEVICE_INDEX = _env_int("WHISPER_DEVICE_INDEX", 0, 0)
+WHISPER_BEAM_SIZE = _env_int("WHISPER_BEAM_SIZE", 5, 1)
+WHISPER_VAD_ENABLED = _env_bool("WHISPER_VAD_ENABLED", True)
+WHISPER_VAD_MIN_SILENCE_MS = _env_int("WHISPER_VAD_MIN_SILENCE_MS", 2000, 0)
+WHISPER_MODEL_CACHE_DIR = os.environ.get("WHISPER_MODEL_CACHE_DIR", "").strip()
+WHISPER_BACKEND = "faster-whisper"
 CHUNK_SECONDS = _env_int("WHISPER_CHUNK_SECONDS", 3600, 900)
 CHUNK_OVERLAP_SECONDS = _env_int("WHISPER_CHUNK_OVERLAP_SECONDS", 10, 0)
 FFMPEG_TIMEOUT_SECONDS = _env_int("WHISPER_AUDIO_LOAD_TIMEOUT", 1800)
@@ -56,6 +64,14 @@ TRANSCRIBE_INITIAL_PROMPTS = {
 DEFAULT_TRANSCRIBE_INITIAL_PROMPT = (
     "家人们，欢迎来到直播间！今天这款宝贝限时秒杀，原价九十九元，现价只要四十九块九！"
     "喜欢的宝宝赶紧拍，库存不多，手慢无！有问题可以在评论区留言，主播马上回复。"
+)
+
+CUDA_OOM_MARKERS = (
+    "cuda out of memory",
+    "cuda error: out of memory",
+    "cuda failed with error out of memory",
+    "cuda oom",
+    "cublas_status_alloc_failed",
 )
 
 
@@ -83,6 +99,19 @@ def resolve_transcribe_initial_prompt(
     if language is None:
         return None
     return TRANSCRIBE_INITIAL_PROMPTS.get(language, DEFAULT_TRANSCRIBE_INITIAL_PROMPT)
+
+
+def is_cuda_oom_error(exc: BaseException) -> bool:
+    """识别 CTranslate2 及兼容层抛出的 CUDA 显存不足错误。"""
+    current: Optional[BaseException] = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        message = str(current).lower()
+        if any(marker in message for marker in CUDA_OOM_MARKERS):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def _run_process(command: list[str], timeout: int, capture_stdout: bool = False) -> bytes:
@@ -212,18 +241,33 @@ def build_chunk_ranges(duration: float, chunk_seconds: int = CHUNK_SECONDS) -> l
 
 
 class WhisperEngine:
-    """固定 turbo 的单进程推理引擎。实例生命周期等同于 Worker 生命周期。"""
+    """固定 turbo 的 Faster-Whisper 引擎，生命周期等同于 Worker 生命周期。"""
 
     def __init__(self, model_name: str = EFFECTIVE_MODEL_NAME, device: str = WHISPER_DEVICE):
         if model_name != "turbo":
             logger.warning("WHISPER_MODEL=%s 被忽略，固定使用 turbo", model_name)
         if device != "cuda":
             raise RuntimeError("生产推理固定要求 WHISPER_DEVICE=cuda")
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA 不可用，拒绝将 turbo 自动回退到 CPU")
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError as exc:
+            raise RuntimeError("未安装 faster-whisper，无法启动推理Worker") from exc
         self.model_name = "turbo"
         self.device = "cuda"
-        self.model = whisper.load_model(self.model_name, device=self.device)
+        self.compute_type = WHISPER_COMPUTE_TYPE
+        self.device_index = WHISPER_DEVICE_INDEX
+        download_root = (
+            str(Path(WHISPER_MODEL_CACHE_DIR).expanduser().resolve())
+            if WHISPER_MODEL_CACHE_DIR
+            else None
+        )
+        self.model = WhisperModel(
+            self.model_name,
+            device=self.device,
+            device_index=self.device_index,
+            compute_type=self.compute_type,
+            download_root=download_root,
+        )
 
     def transcribe_range(
         self,
@@ -239,13 +283,23 @@ class WhisperEngine:
         extract_end = min(total_duration, owner.owner_end + CHUNK_OVERLAP_SECONDS)
         pcm_path: Optional[str] = None
         audio = None
-        result = None
+        result_segments = None
+        info = None
         try:
             if stage_callback:
                 stage_callback("decoding")
             pcm_path = _extract_pcm(audio_path, extract_start, extract_end)
             audio = _pcm_file_to_float32(pcm_path)
-            kwargs = {"verbose": verbose, "fp16": True}
+            kwargs = {
+                "beam_size": WHISPER_BEAM_SIZE,
+                "condition_on_previous_text": True,
+                "vad_filter": WHISPER_VAD_ENABLED,
+                "log_progress": verbose,
+            }
+            if WHISPER_VAD_ENABLED:
+                kwargs["vad_parameters"] = {
+                    "min_silence_duration_ms": WHISPER_VAD_MIN_SILENCE_MS
+                }
             resolved_prompt = resolve_transcribe_initial_prompt(language, initial_prompt)
             if resolved_prompt:
                 kwargs["initial_prompt"] = resolved_prompt
@@ -253,12 +307,12 @@ class WhisperEngine:
                 kwargs["language"] = language
             if stage_callback:
                 stage_callback("transcribing")
-            with torch.inference_mode():
-                result = self.model.transcribe(audio, **kwargs)
+            result_segments, info = self.model.transcribe(audio, **kwargs)
             accepted: list[dict] = []
-            for segment in result.get("segments", []):
-                raw_start = extract_start + float(segment.get("start", 0.0))
-                raw_end = extract_start + float(segment.get("end", 0.0))
+            # faster-whisper 的 segments 是惰性生成器，必须完整迭代才会执行推理。
+            for segment in result_segments:
+                raw_start = extract_start + float(segment.start)
+                raw_end = extract_start + float(segment.end)
                 midpoint = (raw_start + raw_end) / 2
                 is_last = math.isclose(owner.owner_end, total_duration)
                 if midpoint < owner.owner_start:
@@ -267,14 +321,16 @@ class WhisperEngine:
                     continue
                 start = max(owner.owner_start, min(total_duration, raw_start))
                 end = min(owner.owner_end, total_duration, raw_end)
-                text = str(segment.get("text", "")).strip()
+                text = str(segment.text).strip()
                 if text and start <= end:
                     accepted.append({"start": start, "end": end, "text": text})
-            detected = language or result.get("language")
+            detected = language or getattr(info, "language", None)
             return accepted, detected
         finally:
-            if result is not None:
-                del result
+            if result_segments is not None:
+                del result_segments
+            if info is not None:
+                del info
             if audio is not None:
                 del audio
             if pcm_path:
@@ -333,11 +389,12 @@ def transcribe_file_chunked(
                     else None
                 ),
             )
-        except torch.cuda.OutOfMemoryError:
-            torch.cuda.empty_cache()
+        except Exception as exc:
+            if not is_cuda_oom_error(exc):
+                raise
             owner_duration = owner.owner_end - owner.owner_start
             if owner_duration <= MIN_CHUNK_SECONDS + 0.001:
-                raise RuntimeError("15分钟分块仍发生 CUDA OOM")
+                raise RuntimeError("15分钟分块仍发生 CUDA OOM") from exc
             midpoint = owner.owner_start + owner_duration / 2
             work.appendleft(ChunkRange(midpoint, owner.owner_end))
             work.appendleft(ChunkRange(owner.owner_start, midpoint))
