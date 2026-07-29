@@ -1,10 +1,25 @@
 @echo off
 chcp 65001 >nul
+setlocal
 
-cd /d %~dp0\..
+set "PROJECT_ROOT=%~dp0.."
+set "CONDA_EXE=C:\ProgramData\anaconda3\Scripts\conda.exe"
+set "ENV_NAME=fasterwhisper"
 
-call C:\ProgramData\anaconda3\Scripts\activate.bat fasterwhisper
-REM call venv\Scripts\activate.bat
+cd /d "%PROJECT_ROOT%"
+
+if not exist "%CONDA_EXE%" (
+    echo [ERROR] Conda was not found: "%CONDA_EXE%"
+    echo Update CONDA_EXE in this file if Conda is installed elsewhere.
+    exit /b 1
+)
+
+"%CONDA_EXE%" run -n "%ENV_NAME%" python -c "import uvicorn, fastapi, faster_whisper" >nul 2>&1
+if errorlevel 1 (
+    echo [ERROR] Conda environment "%ENV_NAME%" is missing or incomplete.
+    echo Run scripts\setup_api_18000.bat once as Administrator.
+    exit /b 1
+)
 
 set WHISPER_MODEL=turbo
 set WHISPER_DEVICE=cuda
@@ -21,4 +36,5 @@ set WHISPER_QUEUE_MAX_TASKS=5
 set WHISPER_MIN_FREE_DISK_GB=20
 set WHISPER_WORKER_MAX_RSS_GROWTH_MB=2048
 
-python scripts\run_api.py --port 18000
+"%CONDA_EXE%" run --no-capture-output -n "%ENV_NAME%" python scripts\run_api.py --host 0.0.0.0 --port 18000
+exit /b %ERRORLEVEL%
