@@ -269,6 +269,18 @@ class WhisperEngine:
             download_root=download_root,
         )
 
+    def recover_from_cuda_oom(self) -> None:
+        """重载底层 CT2 模型，释放 OOM 后保留的 CUDA allocator cache。"""
+        backend_model = getattr(self.model, "model", None)
+        if backend_model is None:
+            raise RuntimeError("CUDA OOM 后无法访问 CTranslate2 模型，必须回收Worker")
+        try:
+            backend_model.unload_model()
+            gc.collect()
+            backend_model.load_model()
+        except Exception as exc:
+            raise RuntimeError("CUDA OOM 后重载 CTranslate2 模型失败，必须回收Worker") from exc
+
     def transcribe_range(
         self,
         audio_path: str,
@@ -395,6 +407,7 @@ def transcribe_file_chunked(
             owner_duration = owner.owner_end - owner.owner_start
             if owner_duration <= MIN_CHUNK_SECONDS + 0.001:
                 raise RuntimeError("15分钟分块仍发生 CUDA OOM") from exc
+            engine.recover_from_cuda_oom()
             midpoint = owner.owner_start + owner_duration / 2
             work.appendleft(ChunkRange(midpoint, owner.owner_end))
             work.appendleft(ChunkRange(owner.owner_start, midpoint))

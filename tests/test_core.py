@@ -27,6 +27,10 @@ class FakeEngine:
     def __init__(self, oom_above=None):
         self.oom_above = oom_above
         self.calls = []
+        self.oom_recoveries = 0
+
+    def recover_from_cuda_oom(self):
+        self.oom_recoveries += 1
 
     def transcribe_range(
         self, audio_path, owner, total_duration, language, initial_prompt, stage_callback=None
@@ -122,6 +126,35 @@ class CoreChunkTests(unittest.TestCase):
         successful = [item for item in engine.calls if item.owner_end - item.owner_start <= 1800]
         self.assertEqual(2, len(successful))
         self.assertEqual(2, metadata["chunks_processed"])
+        self.assertEqual(1, engine.oom_recoveries)
+
+    @patch("src.core.gc.collect")
+    def test_cuda_oom_recovery_unloads_and_reloads_ctranslate2_model(self, collect):
+        calls = []
+
+        class BackendModel:
+            def unload_model(self):
+                calls.append("unload")
+
+            def load_model(self):
+                calls.append("load")
+
+        engine = WhisperEngine.__new__(WhisperEngine)
+        engine.model = SimpleNamespace(model=BackendModel())
+        engine.recover_from_cuda_oom()
+
+        self.assertEqual(["unload", "load"], calls)
+        collect.assert_called_once_with()
+
+    def test_cuda_oom_recovery_failure_remains_fatal(self):
+        class BackendModel:
+            def unload_model(self):
+                raise RuntimeError("allocator state is invalid")
+
+        engine = WhisperEngine.__new__(WhisperEngine)
+        engine.model = SimpleNamespace(model=BackendModel())
+        with self.assertRaisesRegex(RuntimeError, "CUDA OOM"):
+            engine.recover_from_cuda_oom()
 
     def test_cuda_oom_detection_handles_ctranslate2_errors_and_causes(self):
         self.assertTrue(is_cuda_oom_error(RuntimeError("CUDA failed with error out of memory")))

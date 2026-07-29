@@ -11,9 +11,10 @@ services:
       - ./logs:/app/logs
       - ./tmp:/app/tmp
       # 如果需要持久化模型，取消注释
-      # - ~/.cache/whisper:/root/.cache/whisper
+      # - ~/.cache/faster-whisper:/root/.cache/faster-whisper
     environment:
       - PYTHONUNBUFFERED=1
+      - WHISPER_MODEL_CACHE_DIR=/root/.cache/faster-whisper
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:18000/health')"]

@@ -1,10 +1,14 @@
 import asyncio
 import json
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from src.api import _make_task_payload, _safe_upload_name, health_check
+from fastapi import HTTPException
+
+from src import api
+from src.api import _make_task_payload, _prepare_async_task_dir, _safe_upload_name, health_check
 
 
 class ApiContractTests(unittest.TestCase):
@@ -44,6 +48,47 @@ class ApiContractTests(unittest.TestCase):
         self.assertEqual("float16", payload["compute_type"])
         self.assertEqual(0, payload["device_index"])
         self.assertTrue(payload["vad_enabled"])
+
+    def test_completed_async_task_id_can_be_reused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            task_root = Path(directory)
+            task_dir = task_root / "repeatable-task"
+            task_dir.mkdir()
+            (task_dir / "status.json").write_text(
+                json.dumps({"status": "completed"}), encoding="utf-8"
+            )
+            (task_dir / "result.txt").write_text("old result", encoding="utf-8")
+
+            with (
+                patch.object(api, "TASK_DIR", task_root),
+                patch.object(api.coordinator, "known_ids", set()),
+                patch.object(api.coordinator, "has_capacity", return_value=True),
+            ):
+                api.TASK_STATUS.pop("repeatable-task", None)
+                prepared = _prepare_async_task_dir("repeatable-task")
+
+            self.assertEqual(task_dir, prepared)
+            self.assertFalse(task_dir.exists())
+
+    def test_active_async_task_id_still_rejects_concurrent_rerun(self):
+        with tempfile.TemporaryDirectory() as directory:
+            task_root = Path(directory)
+            task_dir = task_root / "active-task"
+            task_dir.mkdir()
+            (task_dir / "status.json").write_text(
+                json.dumps({"status": "processing"}), encoding="utf-8"
+            )
+
+            with (
+                patch.object(api, "TASK_DIR", task_root),
+                patch.object(api.coordinator, "known_ids", set()),
+            ):
+                api.TASK_STATUS.pop("active-task", None)
+                with self.assertRaises(HTTPException) as context:
+                    _prepare_async_task_dir("active-task")
+
+            self.assertEqual(409, context.exception.status_code)
+            self.assertTrue(task_dir.exists())
 
 
 if __name__ == "__main__":

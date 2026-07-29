@@ -32,6 +32,7 @@ STATUS_RETENTION_SECONDS = 3600
 TASK_FILE_RETENTION_SECONDS = 86400
 EFFECTIVE_MODEL_NAME = "turbo"
 TASK_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+ACTIVE_TASK_STATUSES = {"uploading", "pending", "queued", "processing", "cancelling"}
 
 
 def _env_int(name: str, default: int, minimum: int = 0) -> int:
@@ -136,6 +137,23 @@ def _validate_task_id(task_id: str) -> None:
 def _safe_upload_name(filename: Optional[str]) -> str:
     name = Path(filename or "audio.bin").name
     return f"source-{name or 'audio.bin'}"
+
+
+def _prepare_async_task_dir(task_id: str) -> Path:
+    task_dir = TASK_DIR / task_id
+    if task_id in coordinator.known_ids:
+        raise HTTPException(status_code=409, detail=f"任务 {task_id} 正在执行")
+
+    previous_status = get_task_status(task_id) if task_dir.exists() else None
+    if previous_status and previous_status.get("status") in ACTIVE_TASK_STATUSES:
+        raise HTTPException(status_code=409, detail=f"任务 {task_id} 正在执行")
+    if not coordinator.has_capacity():
+        raise HTTPException(status_code=429, detail="Whisper任务队列已满")
+
+    if task_dir.exists():
+        shutil.rmtree(task_dir)
+        TASK_STATUS.pop(task_id, None)
+    return task_dir
 
 
 def _ensure_disk_space() -> None:
@@ -412,11 +430,7 @@ async def transcribe_start(
     initial_prompt: Optional[str] = Form(None),
 ):
     _validate_task_id(task_step_id)
-    task_dir = TASK_DIR / task_step_id
-    if task_dir.exists() or task_step_id in coordinator.known_ids:
-        raise HTTPException(status_code=409, detail=f"任务 {task_step_id} 已存在")
-    if not coordinator.has_capacity():
-        raise HTTPException(status_code=429, detail="Whisper任务队列已满")
+    task_dir = _prepare_async_task_dir(task_step_id)
     audio_path = task_dir / _safe_upload_name(file.filename)
     update_task_status(task_step_id, status="uploading", stage="uploading", message="正在保存上传文件", async_task=True)
     try:
