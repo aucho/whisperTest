@@ -3,8 +3,8 @@ chcp 65001 >nul
 setlocal
 
 set "PROJECT_ROOT=%~dp0.."
-set "CONDA_EXE=C:\ProgramData\anaconda3\Scripts\conda.exe"
-set "ENV_NAME=fasterwhisper"
+set "ENV_DIR=C:\Users\hh-ai\.conda\envs\fasterwhisper"
+set "PYTHON_EXE=%ENV_DIR%\python.exe"
 set "FIREWALL_RULE=Whisper API TCP 18000"
 
 cd /d "%PROJECT_ROOT%"
@@ -16,27 +16,22 @@ if errorlevel 1 (
     exit /b 1
 )
 
-if not exist "%CONDA_EXE%" (
-    echo [ERROR] Conda was not found: "%CONDA_EXE%"
-    echo Update CONDA_EXE in this file if Conda is installed elsewhere.
+if not exist "%PYTHON_EXE%" (
+    echo [ERROR] The required fasterwhisper Python executable was not found:
+    echo   "%PYTHON_EXE%"
     pause
     exit /b 1
 )
 
-echo [1/4] Checking Conda environment "%ENV_NAME%"...
-"%CONDA_EXE%" run -n "%ENV_NAME%" python -c "import sys" >nul 2>&1
-if errorlevel 1 (
-    echo Environment not found. Creating it with Python 3.11...
-    "%CONDA_EXE%" create -n "%ENV_NAME%" python=3.11 -y
-    if errorlevel 1 goto :failed
-)
+echo [1/4] Using the existing fasterwhisper environment:
+echo   "%ENV_DIR%"
 
 echo [2/4] Installing Python dependencies...
-"%CONDA_EXE%" run -n "%ENV_NAME%" python -m pip install -r requirements.txt
+"%PYTHON_EXE%" -m pip install -r requirements.txt
 if errorlevel 1 goto :failed
 
 echo [3/4] Verifying required modules...
-"%CONDA_EXE%" run -n "%ENV_NAME%" python -c "import uvicorn, fastapi, faster_whisper; print('Python dependencies OK')"
+"%PYTHON_EXE%" -c "import uvicorn, fastapi, faster_whisper; print('Python dependencies OK')"
 if errorlevel 1 goto :failed
 
 echo [4/4] Allowing inbound TCP port 18000...

@@ -3,21 +3,22 @@ chcp 65001 >nul
 setlocal
 
 set "PROJECT_ROOT=%~dp0.."
-set "CONDA_EXE=C:\ProgramData\anaconda3\Scripts\conda.exe"
-set "ENV_NAME=fasterwhisper"
+set "PYTHON_EXE=C:\Users\hh-ai\.conda\envs\fasterwhisper\python.exe"
 
 cd /d "%PROJECT_ROOT%"
 
-if not exist "%CONDA_EXE%" (
-    echo [ERROR] Conda was not found: "%CONDA_EXE%"
-    echo Update CONDA_EXE in this file if Conda is installed elsewhere.
+if not exist "%PYTHON_EXE%" (
+    echo [ERROR] The required fasterwhisper Python executable was not found:
+    echo   "%PYTHON_EXE%"
     exit /b 1
 )
 
-"%CONDA_EXE%" run -n "%ENV_NAME%" python -c "import uvicorn, fastapi, faster_whisper" >nul 2>&1
+echo Using Python: "%PYTHON_EXE%"
+"%PYTHON_EXE%" -c "import uvicorn, fastapi, faster_whisper"
 if errorlevel 1 (
-    echo [ERROR] Conda environment "%ENV_NAME%" is missing or incomplete.
-    echo Run scripts\setup_api_18000.bat once as Administrator.
+    echo [ERROR] The Python environment above is missing a required dependency.
+    echo Install dependencies with:
+    echo   "%PYTHON_EXE%" -m pip install -r "%PROJECT_ROOT%\requirements.txt"
     exit /b 1
 )
 
@@ -35,6 +36,7 @@ set WHISPER_CHUNK_TIMEOUT_SECONDS=7200
 set WHISPER_QUEUE_MAX_TASKS=5
 set WHISPER_MIN_FREE_DISK_GB=20
 set WHISPER_WORKER_MAX_RSS_GROWTH_MB=2048
+set PYTHONUNBUFFERED=1
 
-"%CONDA_EXE%" run --no-capture-output -n "%ENV_NAME%" python scripts\run_api.py --host 0.0.0.0 --port 18000
+"%PYTHON_EXE%" scripts\run_api.py --host 0.0.0.0 --port 18000
 exit /b %ERRORLEVEL%
