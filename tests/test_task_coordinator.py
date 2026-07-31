@@ -55,6 +55,25 @@ class CoordinatorTests(unittest.TestCase):
         self.assertTrue(self.coordinator.worker_ready)
         self.assertIsNone(self.coordinator.current)
         self.assertEqual("completed", self.statuses["one"]["status"])
+        self.assertEqual("转录完成", self.statuses["one"]["message"])
+
+    def test_completed_message_includes_chunk_warnings(self):
+        task = self.task("one")
+        self.coordinator.current = task
+        self.coordinator.known_ids.add("one")
+        self.coordinator._handle_event(
+            {
+                "type": "task_completed",
+                "task_id": "one",
+                "metadata": {
+                    "language_detected": "en",
+                    "chunk_warnings": ["分片2解码结果为空(3600.00-7200.00)"],
+                    "skipped_chunks": [{"chunk": 2, "reason": "音频分块解码结果为空"}],
+                },
+            }
+        )
+        self.assertIn("分片2解码结果为空", self.statuses["one"]["message"])
+        self.assertEqual(1, len(self.statuses["one"]["chunk_warnings"]))
 
 
 if __name__ == "__main__":

@@ -11,7 +11,9 @@ from src.core import (
     WhisperEngine,
     build_chunk_ranges,
     format_timestamp,
+    prepare_audio_source,
     resolve_transcribe_initial_prompt,
+    _needs_aac_remux,
     transcribe_file_chunked,
 )
 
@@ -65,7 +67,7 @@ class CoreChunkTests(unittest.TestCase):
         self.assertEqual(10 * 3600, ranges[-1].owner_start)
         self.assertEqual(10 * 3600 + 123, ranges[-1].owner_end)
 
-    @patch("src.core.probe_audio_duration", return_value=7200.0)
+    @patch("src.core.probe_audio_info", return_value=(7200.0, "mp3"))
     def test_incremental_results_have_monotonic_global_timestamps(self, _probe):
         engine = FakeEngine()
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
@@ -86,7 +88,7 @@ class CoreChunkTests(unittest.TestCase):
             self.assertEqual("en", metadata["language_detected"])
 
     @patch("src.core.torch.cuda.empty_cache")
-    @patch("src.core.probe_audio_duration", return_value=3600.0)
+    @patch("src.core.probe_audio_info", return_value=(3600.0, "mp3"))
     def test_oom_splits_hour_into_two_half_hours(self, _probe, empty_cache):
         engine = FakeEngine(oom_above=1800)
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
@@ -103,7 +105,7 @@ class CoreChunkTests(unittest.TestCase):
         self.assertEqual(2, metadata["chunks_processed"])
         empty_cache.assert_called_once()
 
-    @patch("src.core.probe_audio_duration", return_value=7200.0)
+    @patch("src.core.probe_audio_info", return_value=(7200.0, "mp3"))
     def test_skips_empty_decode_after_first_chunk(self, _probe):
         engine = FakeEngine(empty_from=3600.0)
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
@@ -118,8 +120,14 @@ class CoreChunkTests(unittest.TestCase):
             )
             self.assertEqual("chunk-0", result.read_text(encoding="utf-8").strip())
             self.assertEqual(2, metadata["chunks_processed"])
+            self.assertEqual(
+                ["分片2解码结果为空(3600.00-7200.00)"],
+                metadata["chunk_warnings"],
+            )
+            self.assertEqual(1, len(metadata["skipped_chunks"]))
+            self.assertEqual(2, metadata["skipped_chunks"][0]["chunk"])
 
-    @patch("src.core.probe_audio_duration", return_value=3600.0)
+    @patch("src.core.probe_audio_info", return_value=(3600.0, "mp3"))
     def test_empty_first_chunk_still_fails(self, _probe):
         engine = FakeEngine(empty_from=0.0)
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
@@ -132,6 +140,40 @@ class CoreChunkTests(unittest.TestCase):
                     "en",
                     None,
                 )
+
+    def test_needs_aac_remux_by_suffix_and_format(self):
+        self.assertTrue(_needs_aac_remux("a.aac", "mp3"))
+        self.assertTrue(_needs_aac_remux("a.bin", "aac"))
+        self.assertFalse(_needs_aac_remux("a.m4a", "mov,mp4,m4a,3gp,3g2,mj2"))
+        self.assertFalse(_needs_aac_remux("a.mp3", "mp3"))
+
+    @patch("src.core.probe_audio_duration", return_value=18300.0)
+    @patch("src.core.remux_aac_to_m4a")
+    @patch("src.core.probe_audio_info", return_value=(19020.0, "aac"))
+    def test_prepare_audio_source_remuxes_raw_aac(self, _info, remux, _duration):
+        path, duration, cleanup = prepare_audio_source("live.aac")
+        self.assertTrue(path.endswith(".m4a"))
+        self.assertEqual(18300.0, duration)
+        self.assertEqual(path, cleanup)
+        remux.assert_called_once()
+        if cleanup:
+            Path(cleanup).unlink(missing_ok=True)
+
+    @patch("src.core.probe_audio_duration", return_value=18300.0)
+    @patch("src.core.remux_aac_to_m4a")
+    @patch("src.core.probe_audio_info", return_value=(None, "aac"))
+    def test_prepare_audio_source_remuxes_when_duration_missing(self, _info, remux, _duration):
+        path, duration, cleanup = prepare_audio_source("live.aac")
+        self.assertTrue(path.endswith(".m4a"))
+        self.assertEqual(18300.0, duration)
+        remux.assert_called_once()
+        if cleanup:
+            Path(cleanup).unlink(missing_ok=True)
+
+    @patch("src.core.probe_audio_info", return_value=(None, "mp3"))
+    def test_prepare_audio_source_rejects_missing_duration_for_non_aac(self, _info):
+        with self.assertRaisesRegex(RuntimeError, "无法读取有效音频时长"):
+            prepare_audio_source("live.mp3")
 
     @patch("src.core.os.unlink")
     @patch("src.core._pcm_file_to_float32", return_value=np.zeros(16000, dtype=np.float32))

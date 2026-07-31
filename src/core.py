@@ -103,8 +103,22 @@ def _run_process(command: list[str], timeout: int, capture_stdout: bool = False)
     return stdout or b""
 
 
-def probe_audio_duration(audio_path: str) -> float:
-    """使用 ffprobe 读取时长；输出很小，可以安全捕获。"""
+def _parse_probe_duration(value) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        duration = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(duration) or duration <= 0:
+        return None
+    return duration
+
+
+def probe_audio_info(
+    audio_path: str, *, require_duration: bool = True
+) -> tuple[Optional[float], str]:
+    """使用 ffprobe 读取时长与容器格式；输出很小，可以安全捕获。"""
     output = _run_process(
         [
             "ffprobe",
@@ -113,7 +127,7 @@ def probe_audio_duration(audio_path: str) -> float:
             "-select_streams",
             "a:0",
             "-show_entries",
-            "format=duration:stream=codec_type",
+            "format=duration,format_name:stream=codec_type",
             "-of",
             "json",
             audio_path,
@@ -125,12 +139,83 @@ def probe_audio_duration(audio_path: str) -> float:
         payload = json.loads(output.decode("utf-8"))
         if not any(s.get("codec_type") == "audio" for s in payload.get("streams", [])):
             raise ValueError("没有音轨")
-        duration = float(payload["format"]["duration"])
+        fmt = payload.get("format") or {}
+        format_name = str(fmt.get("format_name") or "")
+        duration = _parse_probe_duration(fmt.get("duration"))
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise RuntimeError("无法读取有效音频时长或文件没有音轨") from exc
-    if not math.isfinite(duration) or duration <= 0:
+    if require_duration and duration is None:
         raise RuntimeError("音频时长无效")
+    return duration, format_name
+
+
+def probe_audio_duration(audio_path: str) -> float:
+    """使用 ffprobe 读取时长；输出很小，可以安全捕获。"""
+    duration, _ = probe_audio_info(audio_path, require_duration=True)
+    assert duration is not None
     return duration
+
+
+def _needs_aac_remux(audio_path: str, format_name: str = "") -> bool:
+    """裸 AAC/ADTS 的 duration/seek 常不可靠，需先封装进 M4A。"""
+    suffix = Path(audio_path).suffix.lower()
+    if suffix in {".aac", ".adts"}:
+        return True
+    primary = (format_name or "").split(",")[0].strip().lower()
+    return primary == "aac"
+
+
+def remux_aac_to_m4a(audio_path: str, output_path: str) -> None:
+    _run_process(
+        [
+            "ffmpeg",
+            "-nostdin",
+            "-hide_banner",
+            "-y",
+            "-loglevel",
+            "error",
+            "-nostats",
+            "-fflags",
+            "+genpts",
+            "-i",
+            audio_path,
+            "-map",
+            "0:a:0",
+            "-c:a",
+            "copy",
+            "-movflags",
+            "+faststart",
+            output_path,
+        ],
+        timeout=FFMPEG_TIMEOUT_SECONDS,
+    )
+
+
+def prepare_audio_source(audio_path: str) -> tuple[str, float, Optional[str]]:
+    """
+    返回 (用于分片的路径, 时长秒, 需要清理的临时文件或 None)。
+    裸 AAC 会先 copy 封装为 M4A，再用封装后的时长分片。
+    原始 duration 缺失时仍允许 AAC remux，避免被不可靠元数据阻断。
+    """
+    duration, format_name = probe_audio_info(audio_path, require_duration=False)
+    if _needs_aac_remux(audio_path, format_name):
+        fd, tmp_path = tempfile.mkstemp(suffix=".m4a")
+        os.close(fd)
+        try:
+            logger.info("检测到裸 AAC，封装为 M4A 后再分片: %s", audio_path)
+            remux_aac_to_m4a(audio_path, tmp_path)
+            duration = probe_audio_duration(tmp_path)
+            return tmp_path, duration, tmp_path
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+    if duration is None:
+        raise RuntimeError("无法读取有效音频时长或文件没有音轨")
+    return audio_path, duration, None
 
 
 def _extract_pcm(audio_path: str, start: float, end: float) -> str:
@@ -298,68 +383,121 @@ def transcribe_file_chunked(
     progress_callback: Optional[ProgressCallback] = None,
     cancel_callback: Optional[CancelCallback] = None,
 ) -> dict:
-    duration = probe_audio_duration(audio_path)
-    work = deque(build_chunk_ranges(duration))
-    total_chunks = len(work)
-    completed_duration = 0.0
-    processed_chunks = 0
-    detected_language = language
-    previous_end = 0.0
-    Path(result_path).write_text("", encoding="utf-8")
-    if timestamp_path:
-        Path(timestamp_path).write_text("", encoding="utf-8")
+    source_path, duration, cleanup_path = prepare_audio_source(audio_path)
+    try:
+        work = deque(build_chunk_ranges(duration))
+        total_chunks = len(work)
+        completed_duration = 0.0
+        processed_chunks = 0
+        detected_language = language
+        previous_end = 0.0
+        chunk_warnings: list[str] = []
+        skipped_chunks: list[dict] = []
+        Path(result_path).write_text("", encoding="utf-8")
+        if timestamp_path:
+            Path(timestamp_path).write_text("", encoding="utf-8")
 
-    while work:
-        if cancel_callback and cancel_callback():
-            raise InterruptedError("任务已取消")
-        owner = work.popleft()
-        chunk_status = {
-            "current_chunk": processed_chunks + 1,
-            "total_chunks": total_chunks,
-            "chunk_owner_start": owner.owner_start,
-            "chunk_owner_end": owner.owner_end,
-            "duration": duration,
-        }
-        try:
-            segments, chunk_language = engine.transcribe_range(
-                audio_path,
-                owner,
-                duration,
-                detected_language,
-                initial_prompt,
-                stage_callback=(
-                    (lambda stage: progress_callback({"stage": stage, **chunk_status}))
-                    if progress_callback
-                    else None
-                ),
-            )
-        except torch.cuda.OutOfMemoryError:
-            torch.cuda.empty_cache()
-            owner_duration = owner.owner_end - owner.owner_start
-            if owner_duration <= MIN_CHUNK_SECONDS + 0.001:
-                raise RuntimeError("15分钟分块仍发生 CUDA OOM")
-            midpoint = owner.owner_start + owner_duration / 2
-            work.appendleft(ChunkRange(midpoint, owner.owner_end))
-            work.appendleft(ChunkRange(owner.owner_start, midpoint))
-            total_chunks += 1
-            logger.warning(
-                "区间 %.2f-%.2f CUDA OOM，拆分为更小区间重试",
-                owner.owner_start,
-                owner.owner_end,
-            )
-            continue
-        except RuntimeError as exc:
-            if str(exc) != "音频分块解码结果为空":
-                raise
-            # 首段为空说明源文件不可用；后续空段多为时长元数据偏长，跳过并拼接其余结果。
-            if processed_chunks == 0:
-                raise
-            logger.warning(
-                "区间 %.2f-%.2f 音频分块解码结果为空，跳过该段",
-                owner.owner_start,
-                owner.owner_end,
-            )
+        while work:
+            if cancel_callback and cancel_callback():
+                raise InterruptedError("任务已取消")
+            owner = work.popleft()
+            chunk_index = processed_chunks + 1
+            chunk_status = {
+                "current_chunk": chunk_index,
+                "total_chunks": total_chunks,
+                "chunk_owner_start": owner.owner_start,
+                "chunk_owner_end": owner.owner_end,
+                "duration": duration,
+            }
+            try:
+                segments, chunk_language = engine.transcribe_range(
+                    source_path,
+                    owner,
+                    duration,
+                    detected_language,
+                    initial_prompt,
+                    stage_callback=(
+                        (lambda stage: progress_callback({"stage": stage, **chunk_status}))
+                        if progress_callback
+                        else None
+                    ),
+                )
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                owner_duration = owner.owner_end - owner.owner_start
+                if owner_duration <= MIN_CHUNK_SECONDS + 0.001:
+                    raise RuntimeError("15分钟分块仍发生 CUDA OOM")
+                midpoint = owner.owner_start + owner_duration / 2
+                work.appendleft(ChunkRange(midpoint, owner.owner_end))
+                work.appendleft(ChunkRange(owner.owner_start, midpoint))
+                total_chunks += 1
+                logger.warning(
+                    "区间 %.2f-%.2f CUDA OOM，拆分为更小区间重试",
+                    owner.owner_start,
+                    owner.owner_end,
+                )
+                continue
+            except RuntimeError as exc:
+                if str(exc) != "音频分块解码结果为空":
+                    raise
+                # 首段为空说明源文件不可用；后续空段多为时长元数据偏长，跳过并拼接其余结果。
+                if processed_chunks == 0:
+                    raise
+                warning = (
+                    f"分片{chunk_index}解码结果为空"
+                    f"({owner.owner_start:.2f}-{owner.owner_end:.2f})"
+                )
+                chunk_warnings.append(warning)
+                skipped_chunks.append(
+                    {
+                        "chunk": chunk_index,
+                        "owner_start": owner.owner_start,
+                        "owner_end": owner.owner_end,
+                        "reason": "音频分块解码结果为空",
+                    }
+                )
+                logger.warning("%s，跳过该段", warning)
+                processed_chunks += 1
+                completed_duration += owner.owner_end - owner.owner_start
+                if progress_callback:
+                    progress_callback(
+                        {
+                            "stage": "writing",
+                            "progress": min(100.0, completed_duration / duration * 100),
+                            "current_chunk": processed_chunks,
+                            "total_chunks": total_chunks,
+                            "duration": duration,
+                            "language_detected": detected_language,
+                            "chunk_warnings": list(chunk_warnings),
+                            "skipped_chunks": list(skipped_chunks),
+                        }
+                    )
+                continue
+
+            detected_language = detected_language or chunk_language
             processed_chunks += 1
+            plain_lines: list[str] = []
+            timestamp_lines: list[str] = []
+            for segment in segments:
+                start = max(previous_end, float(segment["start"]))
+                end = float(segment["end"])
+                if start > end:
+                    logger.warning("跳过倒退时间戳 segment: %s", segment)
+                    continue
+                previous_end = end
+                plain_lines.append(segment["text"])
+                timestamp_lines.append(
+                    f"[{format_timestamp(start)} --> {format_timestamp(end)}] {segment['text']}"
+                )
+            if plain_lines:
+                with open(result_path, "a", encoding="utf-8") as output:
+                    output.write(" ".join(plain_lines).strip() + "\n")
+                    output.flush()
+            if timestamp_path and timestamp_lines:
+                with open(timestamp_path, "a", encoding="utf-8") as output:
+                    output.write("\n".join(timestamp_lines) + "\n")
+                    output.flush()
+
             completed_duration += owner.owner_end - owner.owner_start
             if progress_callback:
                 progress_callback(
@@ -370,53 +508,27 @@ def transcribe_file_chunked(
                         "total_chunks": total_chunks,
                         "duration": duration,
                         "language_detected": detected_language,
+                        "chunk_warnings": list(chunk_warnings),
+                        "skipped_chunks": list(skipped_chunks),
                     }
                 )
-            continue
 
-        detected_language = detected_language or chunk_language
-        processed_chunks += 1
-        plain_lines: list[str] = []
-        timestamp_lines: list[str] = []
-        for segment in segments:
-            start = max(previous_end, float(segment["start"]))
-            end = float(segment["end"])
-            if start > end:
-                logger.warning("跳过倒退时间戳 segment: %s", segment)
-                continue
-            previous_end = end
-            plain_lines.append(segment["text"])
-            timestamp_lines.append(
-                f"[{format_timestamp(start)} --> {format_timestamp(end)}] {segment['text']}"
-            )
-        if plain_lines:
-            with open(result_path, "a", encoding="utf-8") as output:
-                output.write(" ".join(plain_lines).strip() + "\n")
-                output.flush()
-        if timestamp_path and timestamp_lines:
-            with open(timestamp_path, "a", encoding="utf-8") as output:
-                output.write("\n".join(timestamp_lines) + "\n")
-                output.flush()
-
-        completed_duration += owner.owner_end - owner.owner_start
-        if progress_callback:
-            progress_callback(
-                {
-                    "stage": "writing",
-                    "progress": min(100.0, completed_duration / duration * 100),
-                    "current_chunk": processed_chunks,
-                    "total_chunks": total_chunks,
-                    "duration": duration,
-                    "language_detected": detected_language,
-                }
-            )
-
-    gc.collect()
-    return {
-        "duration": duration,
-        "language_detected": detected_language,
-        "chunks_processed": processed_chunks,
-    }
+        gc.collect()
+        result = {
+            "duration": duration,
+            "language_detected": detected_language,
+            "chunks_processed": processed_chunks,
+        }
+        if chunk_warnings:
+            result["chunk_warnings"] = chunk_warnings
+            result["skipped_chunks"] = skipped_chunks
+        return result
+    finally:
+        if cleanup_path:
+            try:
+                os.unlink(cleanup_path)
+            except OSError:
+                pass
 
 
 _legacy_engine: Optional[WhisperEngine] = None

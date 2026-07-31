@@ -251,13 +251,17 @@ class TaskCoordinator:
         if not self.current or self.current["task_id"] != task_id:
             return
         if event["type"] == "task_completed":
-            metadata = event.get("metadata", {})
+            metadata = event.get("metadata", {}) or {}
+            warnings = metadata.get("chunk_warnings") or []
+            message = "转录完成"
+            if warnings:
+                message = f"转录完成（{'；'.join(warnings)}）"
             self.update_status(
                 task_id,
                 status="completed",
                 stage="completed",
                 progress=100.0,
-                message="转录完成",
+                message=message,
                 **metadata,
             )
             result = {"status": "completed", **metadata}
