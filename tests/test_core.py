@@ -17,8 +17,9 @@ from src.core import (
 
 
 class FakeEngine:
-    def __init__(self, oom_above=None):
+    def __init__(self, oom_above=None, empty_from=None):
         self.oom_above = oom_above
+        self.empty_from = empty_from
         self.calls = []
 
     def transcribe_range(
@@ -29,6 +30,8 @@ class FakeEngine:
             stage_callback("transcribing")
         if self.oom_above and owner.owner_end - owner.owner_start > self.oom_above:
             raise torch.cuda.OutOfMemoryError("test")
+        if self.empty_from is not None and owner.owner_start >= self.empty_from:
+            raise RuntimeError("音频分块解码结果为空")
         return (
             [
                 {
@@ -99,6 +102,36 @@ class CoreChunkTests(unittest.TestCase):
         self.assertEqual(2, len(successful))
         self.assertEqual(2, metadata["chunks_processed"])
         empty_cache.assert_called_once()
+
+    @patch("src.core.probe_audio_duration", return_value=7200.0)
+    def test_skips_empty_decode_after_first_chunk(self, _probe):
+        engine = FakeEngine(empty_from=3600.0)
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            result = Path(directory) / "result.txt"
+            metadata = transcribe_file_chunked(
+                engine,
+                "ignored.mp3",
+                str(result),
+                None,
+                "en",
+                None,
+            )
+            self.assertEqual("chunk-0", result.read_text(encoding="utf-8").strip())
+            self.assertEqual(2, metadata["chunks_processed"])
+
+    @patch("src.core.probe_audio_duration", return_value=3600.0)
+    def test_empty_first_chunk_still_fails(self, _probe):
+        engine = FakeEngine(empty_from=0.0)
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            with self.assertRaisesRegex(RuntimeError, "音频分块解码结果为空"):
+                transcribe_file_chunked(
+                    engine,
+                    "ignored.mp3",
+                    str(Path(directory) / "result.txt"),
+                    None,
+                    "en",
+                    None,
+                )
 
     @patch("src.core.os.unlink")
     @patch("src.core._pcm_file_to_float32", return_value=np.zeros(16000, dtype=np.float32))

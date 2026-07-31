@@ -348,6 +348,31 @@ def transcribe_file_chunked(
                 owner.owner_end,
             )
             continue
+        except RuntimeError as exc:
+            if str(exc) != "音频分块解码结果为空":
+                raise
+            # 首段为空说明源文件不可用；后续空段多为时长元数据偏长，跳过并拼接其余结果。
+            if processed_chunks == 0:
+                raise
+            logger.warning(
+                "区间 %.2f-%.2f 音频分块解码结果为空，跳过该段",
+                owner.owner_start,
+                owner.owner_end,
+            )
+            processed_chunks += 1
+            completed_duration += owner.owner_end - owner.owner_start
+            if progress_callback:
+                progress_callback(
+                    {
+                        "stage": "writing",
+                        "progress": min(100.0, completed_duration / duration * 100),
+                        "current_chunk": processed_chunks,
+                        "total_chunks": total_chunks,
+                        "duration": duration,
+                        "language_detected": detected_language,
+                    }
+                )
+            continue
 
         detected_language = detected_language or chunk_language
         processed_chunks += 1
